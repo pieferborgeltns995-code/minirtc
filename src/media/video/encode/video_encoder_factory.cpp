@@ -8,6 +8,7 @@
 #endif
 
 #if defined(_WIN32) || defined(_WIN64)
+#include "wmf/wmf_av1_encoder.h"
 #include "wmf/wmf_h264_encoder.h"
 #if USE_CUDA
 #include "nvcodec/nvidia_video_encoder.h"
@@ -65,6 +66,12 @@ std::unique_ptr<MediaCodec> VideoEncoderFactory::CreateVideoEncoder(
   }
 #endif
   if (codec_type == VideoCodecType::AV1) {
+#if defined(_WIN32) || defined(_WIN64)
+    if (hardware_acceleration && WmfAv1Encoder::IsSupported()) {
+      LOG_INFO("Using the Media Foundation hardware AV1 encoder");
+      return std::make_unique<WmfAv1Encoder>(clock);
+    }
+#endif
     LOG_INFO("Using the SVT-AV1 software encoder");
     return std::make_unique<SvtAv1Encoder>(clock);
   }
@@ -120,6 +127,18 @@ std::unique_ptr<MediaCodec> VideoEncoderFactory::CreateInitializedVideoEncoder(
     std::shared_ptr<SystemClock> clock, const MediaCodecConfig& config,
     bool hardware_acceleration, VideoCodecType codec_type) {
 #if defined(_WIN32) || defined(_WIN64)
+  if (codec_type == VideoCodecType::AV1) {
+    if (hardware_acceleration && WmfAv1Encoder::IsSupported()) {
+      if (auto encoder = TryInitEncoder(
+              std::make_unique<WmfAv1Encoder>(clock), config)) {
+        return encoder;
+      }
+      LOG_WARN(
+          "Hardware AV1 encoder initialization failed; falling back to "
+          "SVT-AV1");
+    }
+    return TryInitEncoder(std::make_unique<SvtAv1Encoder>(clock), config);
+  }
   if (codec_type == VideoCodecType::H264) {
     if (hardware_acceleration) {
 #if USE_CUDA
@@ -166,6 +185,11 @@ bool VideoEncoderFactory::CheckIsHardwareAccelerationSupported(
 #if defined(__ANDROID__)
   return !FindAndroidCodecs(codec_type, true).empty();
 #else
+#if defined(_WIN32) || defined(_WIN64)
+  if (codec_type == VideoCodecType::AV1) {
+    return WmfAv1Encoder::IsSupported();
+  }
+#endif
   if (codec_type != VideoCodecType::H264) {
     return false;
   }
