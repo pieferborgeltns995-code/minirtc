@@ -14,6 +14,7 @@
 #include "avt/svt_av1_encoder.h"
 #include "log.h"
 #include "nv12_scaler.h"
+#include "video/av1_crop_metadata.h"
 #include "wmf/wmf_utils.h"
 
 namespace minirtc {
@@ -71,9 +72,16 @@ bool ValidConfig(const MediaCodecConfig& config) {
          config.key_frame_interval > 0;
 }
 
+enum class EncodeMode {
+  kNative = 0,
+  kPad = 1,
+  kScale = 2,
+};
+
 struct EncodeSize {
   int width = 0;
   int height = 0;
+  EncodeMode mode = EncodeMode::kNative;
 };
 
 int AlignDimDown(int value, int align, int min_value) {
@@ -81,27 +89,84 @@ int AlignDimDown(int value, int align, int min_value) {
   return (value / align) * align;
 }
 
+int AlignDimUp(int value, int align) {
+  if (value <= 0) return align;
+  return ((value + align - 1) / align) * align;
+}
+
 std::vector<EncodeSize> BuildCandidateEncodeSizes(int src_w, int src_h) {
   std::vector<EncodeSize> candidates;
-  auto push_unique = [&](int w, int h) {
-    if (w <= 0 || h <= 0 || (w & 1) != 0 || (h & 1) != 0) return;
+  auto push_unique = [&](int w, int h, EncodeMode mode) {
+    if (w <= 0 || h <= 0 || w > 8192 || h > 8192 ||
+        (w & 1) != 0 || (h & 1) != 0) {
+      return;
+    }
     for (const auto& c : candidates) {
       if (c.width == w && c.height == h) return;
     }
-    candidates.push_back({w, h});
+    candidates.push_back({w, h, mode});
   };
-  push_unique(src_w, src_h);
-  // Some hardware AV1 MFTs (e.g. AMD AMF) reject unaligned desktop resolutions
-  // at MFT_MESSAGE_NOTIFY_START_OF_STREAM unless width is 64-aligned and height
-  // is 16-aligned.
-  push_unique(AlignDimDown(src_w, 64, 64), AlignDimDown(src_h, 16, 16));
+  push_unique(src_w, src_h, EncodeMode::kNative);
+  // Prefer 1:1 edge-clamped padding to 64x16 alignment over scaling so desktop
+  // text keeps native sharpness without bilinear resampling.
+  push_unique(AlignDimUp(src_w, 64), AlignDimUp(src_h, 16), EncodeMode::kPad);
+  // Fallback to downscaling if padded size exceeds hardware limits.
+  push_unique(AlignDimDown(src_w, 64, 64), AlignDimDown(src_h, 16, 16),
+              EncodeMode::kScale);
   if (src_w > 3840 || src_h > 2160) {
     const double scale = std::min(3840.0 / static_cast<double>(src_w),
                                   2160.0 / static_cast<double>(src_h));
     push_unique(AlignDimDown(static_cast<int>(src_w * scale), 64, 64),
-                AlignDimDown(static_cast<int>(src_h * scale), 16, 16));
+                AlignDimDown(static_cast<int>(src_h * scale), 16, 16),
+                EncodeMode::kScale);
   }
   return candidates;
+}
+
+bool PadNv12EdgeClamp(const uint8_t* src, int src_w, int src_h, uint8_t* dst,
+                      int dst_w, int dst_h) {
+  if (!src || !dst || src_w <= 0 || src_h <= 0 || dst_w < src_w ||
+      dst_h < src_h || (src_w & 1) != 0 || (src_h & 1) != 0 ||
+      (dst_w & 1) != 0 || (dst_h & 1) != 0) {
+    return false;
+  }
+  const int pad_right = dst_w - src_w;
+  for (int y = 0; y < src_h; ++y) {
+    const uint8_t* src_row = src + static_cast<size_t>(y) * src_w;
+    uint8_t* dst_row = dst + static_cast<size_t>(y) * dst_w;
+    std::memcpy(dst_row, src_row, static_cast<size_t>(src_w));
+    if (pad_right > 0) {
+      std::memset(dst_row + src_w, src_row[src_w - 1],
+                  static_cast<size_t>(pad_right));
+    }
+  }
+  const uint8_t* last_y = dst + static_cast<size_t>(src_h - 1) * dst_w;
+  for (int y = src_h; y < dst_h; ++y) {
+    std::memcpy(dst + static_cast<size_t>(y) * dst_w, last_y,
+                static_cast<size_t>(dst_w));
+  }
+
+  const uint8_t* src_uv = src + static_cast<size_t>(src_w) * src_h;
+  uint8_t* dst_uv = dst + static_cast<size_t>(dst_w) * dst_h;
+  const int src_uv_h = src_h / 2;
+  const int dst_uv_h = dst_h / 2;
+  for (int y = 0; y < src_uv_h; ++y) {
+    const uint8_t* src_row = src_uv + static_cast<size_t>(y) * src_w;
+    uint8_t* dst_row = dst_uv + static_cast<size_t>(y) * dst_w;
+    std::memcpy(dst_row, src_row, static_cast<size_t>(src_w));
+    const uint8_t u = src_row[src_w - 2];
+    const uint8_t v = src_row[src_w - 1];
+    for (int x = src_w; x < dst_w; x += 2) {
+      dst_row[x] = u;
+      dst_row[x + 1] = v;
+    }
+  }
+  const uint8_t* last_uv = dst_uv + static_cast<size_t>(src_uv_h - 1) * dst_w;
+  for (int y = src_uv_h; y < dst_uv_h; ++y) {
+    std::memcpy(dst_uv + static_cast<size_t>(y) * dst_w, last_uv,
+                static_cast<size_t>(dst_w));
+  }
+  return true;
 }
 
 struct Av1ObuSpan {
@@ -288,6 +353,7 @@ class WmfAv1Encoder::Impl {
           if (SUCCEEDED(last_hr)) {
             encode_width_ = candidate.width;
             encode_height_ = candidate.height;
+            encode_mode_ = candidate.mode;
             break;
           }
           LOG_DEBUG("Hardware AV1 MFT config {}x{} failed: 0x{:08x}",
@@ -308,8 +374,12 @@ class WmfAv1Encoder::Impl {
           WideCharToMultiByte(CP_UTF8, 0, name, -1, utf8, sizeof(utf8), nullptr,
                               nullptr);
           LOG_INFO("Media Foundation hardware AV1 encoder: {}", utf8);
-          if (encode_width_ != source_width_ ||
-              encode_height_ != source_height_) {
+          if (encode_mode_ == EncodeMode::kPad) {
+            LOG_INFO(
+                "Media Foundation hardware AV1 encoder padding {}x{} -> {}x{} "
+                "(1:1 crop metadata)",
+                source_width_, source_height_, encode_width_, encode_height_);
+          } else if (encode_mode_ == EncodeMode::kScale) {
             LOG_INFO(
                 "Media Foundation hardware AV1 encoder scaling {}x{} -> {}x{}",
                 source_width_, source_height_, encode_width_, encode_height_);
@@ -351,11 +421,14 @@ class WmfAv1Encoder::Impl {
     bool has_seq_header = false;
     bool obu_is_key = false;
     size_t insert_offset = 0;
+    size_t after_seq_offset = 0;
     for (const auto& obu : obus) {
       if (obu.type == kObuTypeTemporalDelimiter && obu.offset == 0) {
         insert_offset = obu.offset + obu.size;
+        after_seq_offset = insert_offset;
       } else if (obu.type == kObuTypeSequenceHeader) {
         has_seq_header = true;
+        after_seq_offset = obu.offset + obu.size;
         sequence_header_.assign(bytes.data() + obu.offset,
                                 bytes.data() + obu.offset + obu.size);
       } else if ((obu.type == kObuTypeFrameHeader ||
@@ -394,14 +467,22 @@ class WmfAv1Encoder::Impl {
       if (!sequence_header_.empty()) {
         bytes.insert(bytes.begin() + static_cast<ptrdiff_t>(insert_offset),
                      sequence_header_.begin(), sequence_header_.end());
+        after_seq_offset = insert_offset + sequence_header_.size();
       }
     }
+    if (key && encode_mode_ == EncodeMode::kPad && source_width_ > 0 &&
+        source_height_ > 0 && source_width_ <= 65535 &&
+        source_height_ <= 65535) {
+      av1_crop::AppendCropMetadataObu(bytes, after_seq_offset,
+                                      static_cast<uint16_t>(source_width_),
+                                      static_cast<uint16_t>(source_height_));
+    }
 
-    EncodedFrame frame(bytes.data(), bytes.size(),
-                       static_cast<uint32_t>(encode_width_),
-                       static_cast<uint32_t>(encode_height_));
-    frame.SetEncodedWidth(static_cast<uint32_t>(encode_width_));
-    frame.SetEncodedHeight(static_cast<uint32_t>(encode_height_));
+    const uint32_t out_w = static_cast<uint32_t>(VisibleWidth());
+    const uint32_t out_h = static_cast<uint32_t>(VisibleHeight());
+    EncodedFrame frame(bytes.data(), bytes.size(), out_w, out_h);
+    frame.SetEncodedWidth(out_w);
+    frame.SetEncodedHeight(out_h);
     frame.SetFrameType(key ? kVideoFrameKey : kVideoFrameDelta);
     frame.SetCapturedTimestamp(raw.CapturedTimestamp());
     frame.SetEncodedTimestamp(clock_->CurrentTime());
@@ -410,6 +491,13 @@ class WmfAv1Encoder::Impl {
       force_idr_ = false;
     }
     return S_OK;
+  }
+
+  int VisibleWidth() const {
+    return encode_mode_ == EncodeMode::kScale ? encode_width_ : source_width_;
+  }
+  int VisibleHeight() const {
+    return encode_mode_ == EncodeMode::kScale ? encode_height_ : source_height_;
   }
 
   HRESULT EncodeHardware(const RawFrame& raw,
@@ -436,7 +524,18 @@ class WmfAv1Encoder::Impl {
     const LONGLONG duration = 10'000'000LL / config_.max_frame_rate;
     const uint8_t* sample_buffer = raw.Buffer();
     size_t input_size = 0;
-    if (encode_width_ != source_width_ || encode_height_ != source_height_) {
+    if (encode_mode_ == EncodeMode::kPad) {
+      if (!GetNv12FrameSize(encode_width_, encode_height_, &input_size)) {
+        return E_INVALIDARG;
+      }
+      scaled_nv12_.resize(input_size);
+      if (!PadNv12EdgeClamp(raw.Buffer(), source_width_, source_height_,
+                            scaled_nv12_.data(), encode_width_,
+                            encode_height_)) {
+        return E_FAIL;
+      }
+      sample_buffer = scaled_nv12_.data();
+    } else if (encode_mode_ == EncodeMode::kScale) {
       if (!GetNv12FrameSize(encode_width_, encode_height_, &input_size)) {
         return E_INVALIDARG;
       }
@@ -532,6 +631,7 @@ class WmfAv1Encoder::Impl {
   bool initialized_ = false;
   int source_width_ = 0, source_height_ = 0;
   int encode_width_ = 0, encode_height_ = 0;
+  EncodeMode encode_mode_ = EncodeMode::kNative;
   uint64_t sequence_ = 0;
   LONGLONG next_time_ = 0;
   std::vector<uint8_t> sequence_header_;
@@ -652,8 +752,8 @@ int WmfAv1Encoder::GetResolution(int* width, int* height) const {
   return impl_->worker_.Call([&] {
     if (impl_->fallback_) return impl_->fallback_->GetResolution(width, height);
     if (!impl_->encoder_) return -1;
-    *width = impl_->encode_width_;
-    *height = impl_->encode_height_;
+    *width = impl_->VisibleWidth();
+    *height = impl_->VisibleHeight();
     return 0;
   });
 }

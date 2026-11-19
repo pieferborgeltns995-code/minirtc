@@ -1,8 +1,11 @@
 #include "dav1d_av1_decoder.h"
 
+#include <algorithm>
 #include <utility>
+#include <vector>
 
 #include "log.h"
+#include "video/av1_crop_metadata.h"
 
 // #define SAVE_DECODED_NV12_STREAM
 // #define SAVE_RECEIVED_AV1_STREAM
@@ -136,12 +139,37 @@ int Dav1dAv1Decoder::Decode(
   fwrite((unsigned char *)data, 1, size, file_av1_);
 #endif
 
+  uint32_t meta_w = 0;
+  uint32_t meta_h = 0;
+  bool has_seq = false;
+  std::vector<uint8_t> stripped;
+  av1_crop::ExtractAndStripCropMetadata(data, size, meta_w, meta_h, has_seq,
+                                        stripped);
+  if (has_seq) {
+    crop_width_ = meta_w;
+    crop_height_ = meta_h;
+  }
+
   ScopedDav1dData scoped_dav1d_data;
   Dav1dData &dav1d_data = scoped_dav1d_data.Data();
-  const int wrap_result = dav1d_data_wrap(
-      &dav1d_data, data, size,
-      /*free_callback=*/&NullFreeCallback,
-      /*user_data=*/nullptr);
+  int wrap_result = 0;
+  if (!stripped.empty()) {
+    auto *owned = new std::vector<uint8_t>(std::move(stripped));
+    wrap_result = dav1d_data_wrap(
+        &dav1d_data, owned->data(), owned->size(),
+        [](const uint8_t *, void *cookie) {
+          delete static_cast<std::vector<uint8_t> *>(cookie);
+        },
+        owned);
+    if (wrap_result != 0) {
+      delete owned;
+    }
+  } else {
+    wrap_result = dav1d_data_wrap(
+        &dav1d_data, data, size,
+        /*free_callback=*/&NullFreeCallback,
+        /*user_data=*/nullptr);
+  }
   if (wrap_result != 0) {
     LOG_ERROR("Dav1d AV1 input wrap failed, error={}", wrap_result);
     return -1;
@@ -179,9 +207,17 @@ int Dav1dAv1Decoder::Decode(
               dav1d_picture.p.bpc);
     return -1;
   }
-  frame_width_ = dav1d_picture.p.w;
-  frame_height_ = dav1d_picture.p.h;
-  nv12_frame_size_ = dav1d_picture.p.w * dav1d_picture.p.h * 3 / 2;
+  uint32_t out_width = static_cast<uint32_t>(dav1d_picture.p.w);
+  uint32_t out_height = static_cast<uint32_t>(dav1d_picture.p.h);
+  if (crop_width_ > 0 && crop_height_ > 0 && crop_width_ <= out_width &&
+      crop_height_ <= out_height && (crop_width_ & 1U) == 0 &&
+      (crop_height_ & 1U) == 0) {
+    out_width = crop_width_;
+    out_height = crop_height_;
+  }
+  frame_width_ = out_width;
+  frame_height_ = out_height;
+  nv12_frame_size_ = frame_width_ * frame_height_ * 3 / 2;
 
 #if defined(_WIN32) || defined(__linux__)
   if (native_video_output_) {
