@@ -171,9 +171,304 @@ std::vector<uint8_t> ConvertAnnexBToAVCCFiltered(const uint8_t* data, size_t siz
   return avcc_data;
 }
 
+
+namespace {
+
+class Av1BitReader {
+ public:
+  Av1BitReader(const uint8_t* data, size_t size)
+      : data_(data), bit_size_(size * 8) {}
+
+  bool ReadBits(int count, uint32_t& out) {
+    if (count < 0 || count > 32 || bit_pos_ + static_cast<size_t>(count) > bit_size_) {
+      return false;
+    }
+    uint32_t value = 0;
+    for (int i = 0; i < count; ++i) {
+      const size_t byte_index = bit_pos_ >> 3;
+      const int bit_offset = 7 - static_cast<int>(bit_pos_ & 7);
+      value = (value << 1) | ((data_[byte_index] >> bit_offset) & 1U);
+      ++bit_pos_;
+    }
+    out = value;
+    return true;
+  }
+
+  bool SkipBits(int count) {
+    if (count < 0 || bit_pos_ + static_cast<size_t>(count) > bit_size_) {
+      return false;
+    }
+    bit_pos_ += static_cast<size_t>(count);
+    return true;
+  }
+
+  bool SkipUvlc() {
+    int leading_zeros = 0;
+    while (true) {
+      uint32_t done = 0;
+      if (!ReadBits(1, done)) return false;
+      if (done) break;
+      ++leading_zeros;
+      if (leading_zeros >= 32) return false;
+    }
+    if (leading_zeros > 0 && !SkipBits(leading_zeros)) return false;
+    return true;
+  }
+
+ private:
+  const uint8_t* data_;
+  size_t bit_size_;
+  size_t bit_pos_ = 0;
+};
+
+bool ExtractAv1SequenceHeaderObu(const uint8_t* data, size_t size,
+                                 std::vector<uint8_t>& seq_obu_raw,
+                                 const uint8_t*& seq_payload,
+                                 size_t& seq_payload_size) {
+  size_t offset = 0;
+  while (offset < size) {
+    const size_t obu_start = offset;
+    const uint8_t header = data[offset++];
+    if ((header & 0x80) != 0) {
+      return false;
+    }
+    const uint8_t obu_type = (header >> 3) & 0x0F;
+    const bool has_extension = (header & 0x04) != 0;
+    const bool has_size = (header & 0x02) != 0;
+
+    if (has_extension) {
+      if (offset >= size) return false;
+      ++offset;
+    }
+
+    size_t obu_size = 0;
+    if (has_size) {
+      uint64_t leb = 0;
+      int shift = 0;
+      bool finished = false;
+      for (int i = 0; i < 8 && offset < size; ++i) {
+        const uint8_t byte = data[offset++];
+        leb |= static_cast<uint64_t>(byte & 0x7F) << shift;
+        if ((byte & 0x80) == 0) {
+          finished = true;
+          break;
+        }
+        shift += 7;
+      }
+      if (!finished || leb > size - offset) return false;
+      obu_size = static_cast<size_t>(leb);
+    } else {
+      obu_size = size - offset;
+    }
+
+    const uint8_t* payload_ptr = data + offset;
+    offset += obu_size;
+
+    if (obu_type == 1) {  // OBU_SEQUENCE_HEADER
+      seq_obu_raw.assign(data + obu_start, data + offset);
+      seq_payload = payload_ptr;
+      seq_payload_size = obu_size;
+      return true;
+    }
+  }
+  return false;
+}
+
+bool ParseAv1SequenceHeaderAndBuildAv1C(const std::vector<uint8_t>& seq_obu_raw,
+                                        const uint8_t* seq_payload,
+                                        size_t seq_payload_size,
+                                        int32_t& width, int32_t& height,
+                                        std::vector<uint8_t>& av1c) {
+  Av1BitReader br(seq_payload, seq_payload_size);
+  uint32_t seq_profile = 0;
+  uint32_t still_picture = 0;
+  uint32_t reduced_still_picture_header = 0;
+  if (!br.ReadBits(3, seq_profile) || !br.ReadBits(1, still_picture) ||
+      !br.ReadBits(1, reduced_still_picture_header)) {
+    return false;
+  }
+
+  uint32_t seq_level_idx_0 = 0;
+  uint32_t seq_tier_0 = 0;
+  if (reduced_still_picture_header) {
+    if (!br.ReadBits(5, seq_level_idx_0)) return false;
+  } else {
+    uint32_t timing_info_present = 0;
+    uint32_t decoder_model_info_present = 0;
+    uint32_t buffer_delay_length_minus_1 = 0;
+    if (!br.ReadBits(1, timing_info_present)) return false;
+    if (timing_info_present) {
+      uint32_t equal_picture_interval = 0;
+      if (!br.SkipBits(32) || !br.SkipBits(32) ||
+          !br.ReadBits(1, equal_picture_interval)) {
+        return false;
+      }
+      if (equal_picture_interval && !br.SkipUvlc()) return false;
+      if (!br.ReadBits(1, decoder_model_info_present)) return false;
+      if (decoder_model_info_present) {
+        if (!br.ReadBits(5, buffer_delay_length_minus_1) ||
+            !br.SkipBits(32) || !br.SkipBits(5) || !br.SkipBits(5)) {
+          return false;
+        }
+      }
+    }
+    uint32_t initial_display_delay_present = 0;
+    uint32_t operating_points_cnt_minus_1 = 0;
+    if (!br.ReadBits(1, initial_display_delay_present) ||
+        !br.ReadBits(5, operating_points_cnt_minus_1)) {
+      return false;
+    }
+    for (uint32_t i = 0; i <= operating_points_cnt_minus_1; ++i) {
+      uint32_t level_idx = 0;
+      uint32_t tier = 0;
+      if (!br.SkipBits(12) || !br.ReadBits(5, level_idx)) return false;
+      if (level_idx > 7 && !br.ReadBits(1, tier)) return false;
+      if (i == 0) {
+        seq_level_idx_0 = level_idx;
+        seq_tier_0 = tier;
+      }
+      if (decoder_model_info_present) {
+        uint32_t decoder_model_present_for_op = 0;
+        if (!br.ReadBits(1, decoder_model_present_for_op)) return false;
+        if (decoder_model_present_for_op) {
+          const int n = static_cast<int>(buffer_delay_length_minus_1) + 1;
+          if (!br.SkipBits(n) || !br.SkipBits(n) || !br.SkipBits(1)) {
+            return false;
+          }
+        }
+      }
+      if (initial_display_delay_present) {
+        uint32_t initial_display_delay_present_for_op = 0;
+        if (!br.ReadBits(1, initial_display_delay_present_for_op)) return false;
+        if (initial_display_delay_present_for_op && !br.SkipBits(4)) {
+          return false;
+        }
+      }
+    }
+  }
+
+  uint32_t frame_width_bits_minus_1 = 0;
+  uint32_t frame_height_bits_minus_1 = 0;
+  uint32_t max_frame_width_minus_1 = 0;
+  uint32_t max_frame_height_minus_1 = 0;
+  if (!br.ReadBits(4, frame_width_bits_minus_1) ||
+      !br.ReadBits(4, frame_height_bits_minus_1) ||
+      !br.ReadBits(static_cast<int>(frame_width_bits_minus_1) + 1,
+                   max_frame_width_minus_1) ||
+      !br.ReadBits(static_cast<int>(frame_height_bits_minus_1) + 1,
+                   max_frame_height_minus_1)) {
+    return false;
+  }
+  width = static_cast<int32_t>(max_frame_width_minus_1 + 1);
+  height = static_cast<int32_t>(max_frame_height_minus_1 + 1);
+
+  if (!reduced_still_picture_header) {
+    uint32_t frame_id_numbers_present = 0;
+    if (!br.ReadBits(1, frame_id_numbers_present)) return false;
+    if (frame_id_numbers_present && !br.SkipBits(7)) return false;
+  }
+
+  if (!br.SkipBits(3)) return false;
+
+  if (!reduced_still_picture_header) {
+    uint32_t enable_order_hint = 0;
+    if (!br.SkipBits(4) || !br.ReadBits(1, enable_order_hint)) return false;
+    if (enable_order_hint && !br.SkipBits(2)) return false;
+    uint32_t seq_choose_screen_content_tools = 0;
+    if (!br.ReadBits(1, seq_choose_screen_content_tools)) return false;
+    uint32_t seq_force_screen_content_tools = 2;
+    if (!seq_choose_screen_content_tools &&
+        !br.ReadBits(1, seq_force_screen_content_tools)) {
+      return false;
+    }
+    if (seq_force_screen_content_tools > 0) {
+      uint32_t seq_choose_integer_mv = 0;
+      if (!br.ReadBits(1, seq_choose_integer_mv)) return false;
+      if (!seq_choose_integer_mv && !br.SkipBits(1)) return false;
+    }
+    if (enable_order_hint && !br.SkipBits(3)) return false;
+  }
+
+  if (!br.SkipBits(3)) return false;
+
+  uint32_t high_bitdepth = 0;
+  uint32_t twelve_bit = 0;
+  uint32_t mono_chrome = 0;
+  uint32_t color_description_present = 0;
+  uint32_t color_primaries = 2;
+  uint32_t transfer_characteristics = 2;
+  uint32_t matrix_coefficients = 2;
+  if (!br.ReadBits(1, high_bitdepth)) return false;
+  if (seq_profile == 2 && high_bitdepth && !br.ReadBits(1, twelve_bit)) {
+    return false;
+  }
+  if (seq_profile != 1 && !br.ReadBits(1, mono_chrome)) return false;
+  if (!br.ReadBits(1, color_description_present)) return false;
+  if (color_description_present) {
+    if (!br.ReadBits(8, color_primaries) ||
+        !br.ReadBits(8, transfer_characteristics) ||
+        !br.ReadBits(8, matrix_coefficients)) {
+      return false;
+    }
+  }
+
+  uint32_t subsampling_x = 1;
+  uint32_t subsampling_y = 1;
+  uint32_t chroma_sample_position = 0;
+  if (mono_chrome) {
+    if (!br.SkipBits(1)) return false;
+  } else if (color_primaries == 1 && transfer_characteristics == 13 &&
+             matrix_coefficients == 0) {
+    subsampling_x = 0;
+    subsampling_y = 0;
+  } else {
+    if (!br.SkipBits(1)) return false;
+    if (seq_profile == 0) {
+      subsampling_x = 1;
+      subsampling_y = 1;
+    } else if (seq_profile == 1) {
+      subsampling_x = 0;
+      subsampling_y = 0;
+    } else {
+      if (twelve_bit) {
+        if (!br.ReadBits(1, subsampling_x)) return false;
+        if (subsampling_x) {
+          if (!br.ReadBits(1, subsampling_y)) return false;
+        } else {
+          subsampling_y = 0;
+        }
+      } else {
+        subsampling_x = 1;
+        subsampling_y = 0;
+      }
+    }
+    if (subsampling_x && subsampling_y &&
+        !br.ReadBits(2, chroma_sample_position)) {
+      return false;
+    }
+  }
+
+  av1c.clear();
+  av1c.reserve(4 + seq_obu_raw.size());
+  av1c.push_back(0x81);
+  av1c.push_back(static_cast<uint8_t>(((seq_profile & 0x07) << 5) |
+                                      (seq_level_idx_0 & 0x1F)));
+  av1c.push_back(static_cast<uint8_t>(
+      ((seq_tier_0 & 0x01) << 7) | ((high_bitdepth & 0x01) << 6) |
+      ((twelve_bit & 0x01) << 5) | ((mono_chrome & 0x01) << 4) |
+      ((subsampling_x & 0x01) << 3) | ((subsampling_y & 0x01) << 2) |
+      (chroma_sample_position & 0x03)));
+  av1c.push_back(0x00);
+  av1c.insert(av1c.end(), seq_obu_raw.begin(), seq_obu_raw.end());
+  return width > 0 && height > 0;
+}
+
+}  // namespace
+
 class VideoToolboxDecoder::Impl {
  public:
-  Impl(std::shared_ptr<SystemClock> clock, bool native_video_output);
+  Impl(std::shared_ptr<SystemClock> clock, bool native_video_output,
+       VideoCodecType codec_type);
   ~Impl();
 
   int Init();
@@ -183,6 +478,9 @@ class VideoToolboxDecoder::Impl {
 
  private:
   bool CreateSession(const std::vector<uint8_t>& sps, const std::vector<uint8_t>& pps);
+  bool CreateAv1Session(const std::vector<uint8_t>& seq_obu_raw,
+                        const uint8_t* seq_payload, size_t seq_payload_size);
+  bool CreateDecompressionSessionFromFormatDesc();
   static void DecodeCallback(void* decompression_output_ref_con, void* source_frame_ref_con,
                              OSStatus status, VTDecodeInfoFlags info_flags,
                              CVImageBufferRef image_buffer, CMTime pts, CMTime duration);
@@ -190,6 +488,7 @@ class VideoToolboxDecoder::Impl {
  private:
   std::shared_ptr<SystemClock> clock_;
   const bool native_video_output_;
+  const VideoCodecType codec_type_;
   std::function<void(const DecodedFrame*)> on_receive_decoded_frame_;
   std::atomic<uint64_t> submitted_frame_count_{0};
   std::atomic<uint64_t> decoded_frame_count_{0};
@@ -206,6 +505,7 @@ class VideoToolboxDecoder::Impl {
   CMVideoFormatDescriptionRef format_desc_;
   std::vector<uint8_t> last_sps_;
   std::vector<uint8_t> last_pps_;
+  std::vector<uint8_t> last_av1_seq_obu_;
 
   FILE* file_nv12_ = nullptr;
   FILE* file_h264_ = nullptr;
@@ -214,9 +514,11 @@ class VideoToolboxDecoder::Impl {
 };
 
 VideoToolboxDecoder::Impl::Impl(std::shared_ptr<SystemClock> clock,
-                               bool native_video_output)
+                               bool native_video_output,
+                               VideoCodecType codec_type)
     : clock_(std::move(clock)),
       native_video_output_(native_video_output),
+      codec_type_(codec_type),
       decompression_session_(nullptr),
       format_desc_(nullptr) {}
 
@@ -231,6 +533,7 @@ VideoToolboxDecoder::Impl::~Impl() {
   }
   last_sps_.clear();
   last_pps_.clear();
+  last_av1_seq_obu_.clear();
 
 #ifdef SAVE_DECODED_NV12_STREAM
   if (file_nv12_) {
@@ -300,50 +603,87 @@ int VideoToolboxDecoder::Impl::Decode(
   }
 #endif
 
-  // check if frame contains SPS (NAL type 7) using a more robust method
-  // no longer assume start code is 4 bytes, parse directly with ExtractNalUnits
-  bool has_sps = false;
   bool is_keyframe = false;
-  auto all_nalus = ExtractNalUnits(data, size);
-  for (const auto& nalu : all_nalus) {
-    if (nalu.type == 7) {  // SPS
-      has_sps = true;
-    } else if (nalu.type == 5) {  // IDR
+  std::vector<uint8_t> avcc_data;
+  const uint8_t* sample_bytes = nullptr;
+  size_t sample_size = 0;
+
+  if (codec_type_ == VideoCodecType::AV1) {
+    std::vector<uint8_t> seq_obu_raw;
+    const uint8_t* seq_payload = nullptr;
+    size_t seq_payload_size = 0;
+    const bool has_seq_hdr = ExtractAv1SequenceHeaderObu(
+        data, size, seq_obu_raw, seq_payload, seq_payload_size);
+    if (has_seq_hdr) {
       is_keyframe = true;
+      if (seq_obu_raw != last_av1_seq_obu_) {
+        last_av1_seq_obu_ = seq_obu_raw;
+        session_needs_recovery_.store(true);
+      }
     }
-  }
 
-  if (has_sps) {
-    std::vector<uint8_t> sps, pps;
-    if (!ExtractSpsPps(data, size, sps, pps)) {
-      LOG_ERROR("Failed to extract SPS/PPS from frame data");
+    if (!decompression_session_ || session_needs_recovery_.load()) {
+      if (!has_seq_hdr || seq_obu_raw.empty()) return -1;
+      LOG_INFO("Creating/recovering VideoToolbox AV1 decompression session");
+      if (!CreateAv1Session(seq_obu_raw, seq_payload, seq_payload_size)) {
+        LOG_ERROR("Failed to create VideoToolbox AV1 decompression session");
+        return -1;
+      }
+    }
+
+    if (!data || size == 0) {
+      LOG_ERROR("Empty AV1 frame data");
       return -1;
     }
-
-    if (sps != last_sps_ || pps != last_pps_) {
-      last_sps_ = std::move(sps);
-      last_pps_ = std::move(pps);
-      session_needs_recovery_.store(true);
+    sample_bytes = data;
+    sample_size = size;
+  } else {
+    // check if frame contains SPS (NAL type 7) using a more robust method
+    // no longer assume start code is 4 bytes, parse directly with ExtractNalUnits
+    bool has_sps = false;
+    auto all_nalus = ExtractNalUnits(data, size);
+    for (const auto& nalu : all_nalus) {
+      if (nalu.type == 7) {  // SPS
+        has_sps = true;
+      } else if (nalu.type == 5) {  // IDR
+        is_keyframe = true;
+      }
     }
-  }
 
-  if (!decompression_session_ || session_needs_recovery_.load()) {
-    // A decoder invalidated by iOS backgrounding must be recreated even when
-    // the stream's SPS/PPS are unchanged. Resume at an IDR so references from
-    // the old session are never used by the replacement session. Returning an
-    // error while waiting also makes the receiver request a key frame.
-    if (!is_keyframe || last_sps_.empty() || last_pps_.empty()) return -1;
-    LOG_INFO("Creating/recovering VideoToolbox decompression session at IDR");
-    if (!CreateSession(last_sps_, last_pps_)) {
-      LOG_ERROR("Failed to create decompression session");
+    if (has_sps) {
+      std::vector<uint8_t> sps, pps;
+      if (!ExtractSpsPps(data, size, sps, pps)) {
+        LOG_ERROR("Failed to extract SPS/PPS from frame data");
+        return -1;
+      }
+
+      if (sps != last_sps_ || pps != last_pps_) {
+        last_sps_ = std::move(sps);
+        last_pps_ = std::move(pps);
+        session_needs_recovery_.store(true);
+      }
+    }
+
+    if (!decompression_session_ || session_needs_recovery_.load()) {
+      // A decoder invalidated by iOS backgrounding must be recreated even when
+      // the stream's SPS/PPS are unchanged. Resume at an IDR so references from
+      // the old session are never used by the replacement session. Returning an
+      // error while waiting also makes the receiver request a key frame.
+      if (!is_keyframe || last_sps_.empty() || last_pps_.empty()) return -1;
+      LOG_INFO("Creating/recovering VideoToolbox decompression session at IDR");
+      if (!CreateSession(last_sps_, last_pps_)) {
+        LOG_ERROR("Failed to create decompression session");
+        return -1;
+      }
+    }
+
+    avcc_data = ConvertAnnexBToAVCCFiltered(data, size);
+    if (avcc_data.empty()) {
+      LOG_ERROR("Failed to convert Annex B to AVCC format");
       return -1;
     }
-  }
-
-  auto avcc_data = ConvertAnnexBToAVCCFiltered(data, size);
-  if (avcc_data.empty()) {
-    LOG_ERROR("Failed to convert Annex B to AVCC format");
-    return -1;
+    sample_bytes = avcc_data.data();
+    sample_size = avcc_data.size();
   }
 
   if (!decompression_session_) {
@@ -353,16 +693,16 @@ int VideoToolboxDecoder::Impl::Decode(
 
   CMBlockBufferRef block_buffer = nullptr;
   OSStatus status = CMBlockBufferCreateWithMemoryBlock(
-      kCFAllocatorDefault, nullptr, avcc_data.size(), kCFAllocatorDefault,
-      nullptr, 0, avcc_data.size(), 0, &block_buffer);
+      kCFAllocatorDefault, nullptr, sample_size, kCFAllocatorDefault,
+      nullptr, 0, sample_size, 0, &block_buffer);
   if (status != kCMBlockBufferNoErr) {
     LOG_ERROR("Failed to create block buffer, status: {}", status);
     return -1;
   }
-  status = CMBlockBufferReplaceDataBytes(avcc_data.data(), block_buffer, 0,
-                                         avcc_data.size());
+  status = CMBlockBufferReplaceDataBytes(sample_bytes, block_buffer, 0,
+                                         sample_size);
   if (status != kCMBlockBufferNoErr) {
-    LOG_ERROR("Failed to copy AVCC data into block buffer, status: {}", status);
+    LOG_ERROR("Failed to copy frame data into block buffer, status: {}", status);
     CFRelease(block_buffer);
     return -1;
   }
@@ -375,7 +715,6 @@ int VideoToolboxDecoder::Impl::Decode(
   // A compressed video access unit is one sample. Supplying zero sample-size
   // entries creates a formally valid CMSampleBuffer whose sample size can be
   // reported as zero, which VideoToolbox accepts without producing output.
-  const size_t sample_size = avcc_data.size();
   status = CMSampleBufferCreateReady(nullptr, block_buffer, format_desc_, 1, 1,
                                      &timing, 1, &sample_size, &sample_buffer);
   CFRelease(block_buffer);
@@ -424,7 +763,10 @@ int VideoToolboxDecoder::Impl::Decode(
   return (status == noErr) ? 0 : -1;
 }
 
-std::string VideoToolboxDecoder::Impl::GetDecoderName() const { return "VideoToolbox (H.264)"; }
+std::string VideoToolboxDecoder::Impl::GetDecoderName() const {
+  return codec_type_ == VideoCodecType::AV1 ? "VideoToolbox (AV1)"
+                                            : "VideoToolbox (H.264)";
+}
 
 bool VideoToolboxDecoder::Impl::CreateSession(const std::vector<uint8_t>& sps,
                                               const std::vector<uint8_t>& pps) {
@@ -456,12 +798,79 @@ bool VideoToolboxDecoder::Impl::CreateSession(const std::vector<uint8_t>& sps,
     return false;
   }
 
+  return CreateDecompressionSessionFromFormatDesc();
+}
+
+bool VideoToolboxDecoder::Impl::CreateAv1Session(
+    const std::vector<uint8_t>& seq_obu_raw, const uint8_t* seq_payload,
+    size_t seq_payload_size) {
+  if (decompression_session_) {
+    VTDecompressionSessionWaitForAsynchronousFrames(decompression_session_);
+    VTDecompressionSessionInvalidate(decompression_session_);
+    CFRelease(decompression_session_);
+    decompression_session_ = nullptr;
+  }
+  {
+    std::lock_guard lock(timestamps_mutex_);
+    pending_timestamps_.clear();
+  }
+  if (format_desc_) {
+    CFRelease(format_desc_);
+    format_desc_ = nullptr;
+  }
+  session_needs_recovery_.store(false);
+
+  int32_t width = 0;
+  int32_t height = 0;
+  std::vector<uint8_t> av1c;
+  if (!ParseAv1SequenceHeaderAndBuildAv1C(seq_obu_raw, seq_payload,
+                                          seq_payload_size, width, height,
+                                          av1c)) {
+    LOG_ERROR("Failed to parse AV1 sequence header OBU");
+    return false;
+  }
+
+  CFDataRef av1c_data = CFDataCreate(
+      kCFAllocatorDefault, av1c.data(), static_cast<CFIndex>(av1c.size()));
+  if (!av1c_data) {
+    LOG_ERROR("Failed to allocate CFData for av1C");
+    return false;
+  }
+  const void* atom_keys[] = {CFSTR("av1C")};
+  const void* atom_values[] = {av1c_data};
+  CFDictionaryRef atoms = CFDictionaryCreate(
+      kCFAllocatorDefault, atom_keys, atom_values, 1,
+      &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+  const void* ext_keys[] = {
+      kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms};
+  const void* ext_values[] = {atoms};
+  CFDictionaryRef extensions = CFDictionaryCreate(
+      kCFAllocatorDefault, ext_keys, ext_values, 1,
+      &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+
+  OSStatus status = CMVideoFormatDescriptionCreate(
+      kCFAllocatorDefault, kCMVideoCodecType_AV1, width, height, extensions,
+      &format_desc_);
+  CFRelease(extensions);
+  CFRelease(atoms);
+  CFRelease(av1c_data);
+  if (status != noErr) {
+    LOG_ERROR("Failed to create AV1 format description ({}x{}), status: {}",
+              width, height, status);
+    return false;
+  }
+
+  LOG_INFO("Created VideoToolbox AV1 format description: {}x{}", width, height);
+  return CreateDecompressionSessionFromFormatDesc();
+}
+
+bool VideoToolboxDecoder::Impl::CreateDecompressionSessionFromFormatDesc() {
   VTDecompressionOutputCallbackRecord callback = {};
   callback.decompressionOutputCallback = &DecodeCallback;
   callback.decompressionOutputRefCon = this;
 
   CFMutableDictionaryRef decoder_spec = CFDictionaryCreateMutable(
-      kCFAllocatorDefault, 1, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+      kCFAllocatorDefault, 2, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
   // Leave the simulator free to select its available software decoder.
 #if TARGET_OS_IOS && !TARGET_OS_SIMULATOR
   if (@available(iOS 17.0, *)) {
@@ -475,6 +884,12 @@ bool VideoToolboxDecoder::Impl::CreateSession(const std::vector<uint8_t>& sps,
       decoder_spec,
       kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder,
       kCFBooleanTrue);
+  if (codec_type_ == VideoCodecType::AV1) {
+    CFDictionarySetValue(
+        decoder_spec,
+        kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder,
+        kCFBooleanTrue);
+  }
 #endif
 
   CFMutableDictionaryRef output_attributes = CFDictionaryCreateMutable(
@@ -493,9 +908,9 @@ bool VideoToolboxDecoder::Impl::CreateSession(const std::vector<uint8_t>& sps,
   CFDictionarySetValue(output_attributes, kCVPixelBufferIOSurfacePropertiesKey,
                        io_surface_properties);
 
-  status = VTDecompressionSessionCreate(nullptr, format_desc_, decoder_spec,
-                                        output_attributes, &callback,
-                                        &decompression_session_);
+  OSStatus status = VTDecompressionSessionCreate(
+      nullptr, format_desc_, decoder_spec, output_attributes, &callback,
+      &decompression_session_);
   CFRelease(io_surface_properties);
   CFRelease(pixel_format_number);
   CFRelease(output_attributes);
@@ -635,8 +1050,10 @@ void VideoToolboxDecoder::Impl::DecodeCallback(void* decompression_output_ref_co
 //
 
 VideoToolboxDecoder::VideoToolboxDecoder(std::shared_ptr<SystemClock> clock,
-                                         bool native_video_output)
-    : impl_(std::make_shared<Impl>(std::move(clock), native_video_output)) {}
+                                         bool native_video_output,
+                                         VideoCodecType codec_type)
+    : impl_(std::make_shared<Impl>(std::move(clock), native_video_output,
+                                   codec_type)) {}
 
 VideoToolboxDecoder::~VideoToolboxDecoder() = default;
 
