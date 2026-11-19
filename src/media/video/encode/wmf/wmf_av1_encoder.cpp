@@ -3,6 +3,7 @@
 #include <codecapi.h>
 #include <strmif.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <cstring>
@@ -12,6 +13,7 @@
 
 #include "avt/svt_av1_encoder.h"
 #include "log.h"
+#include "nv12_scaler.h"
 #include "wmf/wmf_utils.h"
 
 namespace minirtc {
@@ -67,6 +69,39 @@ bool ValidConfig(const MediaCodecConfig& config) {
          config.init_bitrate > 0 && config.max_bitrate > 0 &&
          config.max_frame_rate > 0 && config.max_frame_rate <= 240 &&
          config.key_frame_interval > 0;
+}
+
+struct EncodeSize {
+  int width = 0;
+  int height = 0;
+};
+
+int AlignDimDown(int value, int align, int min_value) {
+  if (value <= min_value) return min_value;
+  return (value / align) * align;
+}
+
+std::vector<EncodeSize> BuildCandidateEncodeSizes(int src_w, int src_h) {
+  std::vector<EncodeSize> candidates;
+  auto push_unique = [&](int w, int h) {
+    if (w <= 0 || h <= 0 || (w & 1) != 0 || (h & 1) != 0) return;
+    for (const auto& c : candidates) {
+      if (c.width == w && c.height == h) return;
+    }
+    candidates.push_back({w, h});
+  };
+  push_unique(src_w, src_h);
+  // Some hardware AV1 MFTs (e.g. AMD AMF) reject unaligned desktop resolutions
+  // at MFT_MESSAGE_NOTIFY_START_OF_STREAM unless width is 64-aligned and height
+  // is 16-aligned.
+  push_unique(AlignDimDown(src_w, 64, 64), AlignDimDown(src_h, 16, 16));
+  if (src_w > 3840 || src_h > 2160) {
+    const double scale = std::min(3840.0 / static_cast<double>(src_w),
+                                  2160.0 / static_cast<double>(src_h));
+    push_unique(AlignDimDown(static_cast<int>(src_w * scale), 64, 64),
+                AlignDimDown(static_cast<int>(src_h * scale), 16, 16));
+  }
+  return candidates;
 }
 
 struct Av1ObuSpan {
@@ -146,7 +181,7 @@ class WmfAv1Encoder::Impl {
     force_idr_ = true;
   }
 
-  HRESULT Configure(IMFActivate* activation) {
+  HRESULT Configure(IMFActivate* activation, int width, int height) {
     HRESULT hr = activation->ActivateObject(IID_PPV_ARGS(&encoder_));
     if (FAILED(hr)) return hr;
     ComPtr<IMFAttributes> attributes;
@@ -194,8 +229,7 @@ class WmfAv1Encoder::Impl {
     output->SetGUID(MF_MT_SUBTYPE, kVideoFormatAv1);
     output->SetUINT32(MF_MT_AVG_BITRATE, config_.init_bitrate);
     output->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
-    MFSetAttributeSize(output.Get(), MF_MT_FRAME_SIZE, config_.init_width,
-                       config_.init_height);
+    MFSetAttributeSize(output.Get(), MF_MT_FRAME_SIZE, width, height);
     MFSetAttributeRatio(output.Get(), MF_MT_FRAME_RATE, config_.max_frame_rate,
                         1);
     MFSetAttributeRatio(output.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
@@ -214,7 +248,7 @@ class WmfAv1Encoder::Impl {
     input->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12);
     input->DeleteItem(MF_MT_MPEG2_PROFILE);
     input->DeleteItem(MF_MT_AVG_BITRATE);
-    input->SetUINT32(MF_MT_DEFAULT_STRIDE, config_.init_width);
+    input->SetUINT32(MF_MT_DEFAULT_STRIDE, width);
     hr = encoder_->SetInputType(input_id_, input.Get(), 0);
     if (FAILED(hr)) {
       LOG_WARN("WMF AV1 SetInputType failed (0x{:08x}); retrying without stride",
@@ -244,15 +278,28 @@ class WmfAv1Encoder::Impl {
     UINT32 count = 0;
     HRESULT hr = EnumerateEncoders(&activations, &count);
     if (FAILED(hr)) return hr;
+    const auto candidates = BuildCandidateEncodeSizes(source_width_, source_height_);
     hr = MF_E_TOPO_CODEC_NOT_FOUND;
     for (UINT32 i = 0; i < count; ++i) {
       if (!encoder_) {
-        hr = Configure(activations[i]);
+        HRESULT last_hr = MF_E_TOPO_CODEC_NOT_FOUND;
+        for (const auto& candidate : candidates) {
+          last_hr = Configure(activations[i], candidate.width, candidate.height);
+          if (SUCCEEDED(last_hr)) {
+            encode_width_ = candidate.width;
+            encode_height_ = candidate.height;
+            break;
+          }
+          LOG_DEBUG("Hardware AV1 MFT config {}x{} failed: 0x{:08x}",
+                    candidate.width, candidate.height,
+                    static_cast<uint32_t>(last_hr));
+          Reset();
+          activations[i]->ShutdownObject();
+        }
+        hr = last_hr;
         if (FAILED(hr)) {
           LOG_WARN("Hardware AV1 MFT initialization failed: 0x{:08x}",
                    static_cast<uint32_t>(hr));
-          Reset();
-          activations[i]->ShutdownObject();
         } else {
           WCHAR name[256]{};
           activations[i]->GetString(MFT_FRIENDLY_NAME_Attribute, name, 256,
@@ -261,6 +308,12 @@ class WmfAv1Encoder::Impl {
           WideCharToMultiByte(CP_UTF8, 0, name, -1, utf8, sizeof(utf8), nullptr,
                               nullptr);
           LOG_INFO("Media Foundation hardware AV1 encoder: {}", utf8);
+          if (encode_width_ != source_width_ ||
+              encode_height_ != source_height_) {
+            LOG_INFO(
+                "Media Foundation hardware AV1 encoder scaling {}x{} -> {}x{}",
+                source_width_, source_height_, encode_width_, encode_height_);
+          }
           activations[i]->DetachObject();
         }
       }
@@ -344,9 +397,11 @@ class WmfAv1Encoder::Impl {
       }
     }
 
-    EncodedFrame frame(bytes.data(), bytes.size(), raw.Width(), raw.Height());
-    frame.SetEncodedWidth(raw.Width());
-    frame.SetEncodedHeight(raw.Height());
+    EncodedFrame frame(bytes.data(), bytes.size(),
+                       static_cast<uint32_t>(encode_width_),
+                       static_cast<uint32_t>(encode_height_));
+    frame.SetEncodedWidth(static_cast<uint32_t>(encode_width_));
+    frame.SetEncodedHeight(static_cast<uint32_t>(encode_height_));
     frame.SetFrameType(key ? kVideoFrameKey : kVideoFrameDelta);
     frame.SetCapturedTimestamp(raw.CapturedTimestamp());
     frame.SetEncodedTimestamp(clock_->CurrentTime());
@@ -359,11 +414,12 @@ class WmfAv1Encoder::Impl {
 
   HRESULT EncodeHardware(const RawFrame& raw,
                          std::vector<EncodedFrame>& frames) {
-    if (raw.Width() != static_cast<uint32_t>(config_.init_width) ||
-        raw.Height() != static_cast<uint32_t>(config_.init_height) ||
-        reconfigure_) {
-      config_.init_width = static_cast<int>(raw.Width());
-      config_.init_height = static_cast<int>(raw.Height());
+    if (static_cast<int>(raw.Width()) != source_width_ ||
+        static_cast<int>(raw.Height()) != source_height_ || reconfigure_) {
+      source_width_ = static_cast<int>(raw.Width());
+      source_height_ = static_cast<int>(raw.Height());
+      config_.init_width = source_width_;
+      config_.init_height = source_height_;
       HRESULT hr = Initialize();
       if (FAILED(hr)) return hr;
     }
@@ -378,9 +434,30 @@ class WmfAv1Encoder::Impl {
     }
     ComPtr<IMFSample> input;
     const LONGLONG duration = 10'000'000LL / config_.max_frame_rate;
+    const uint8_t* sample_buffer = raw.Buffer();
     size_t input_size = 0;
-    GetNv12FrameSize(raw.Width(), raw.Height(), &input_size);
-    HRESULT hr = wmf::CreateSample(raw.Buffer(), input_size, next_time_,
+    if (encode_width_ != source_width_ || encode_height_ != source_height_) {
+      if (!GetNv12FrameSize(encode_width_, encode_height_, &input_size)) {
+        return E_INVALIDARG;
+      }
+      scaled_nv12_.resize(input_size);
+      const uint8_t* src_y = raw.Buffer();
+      const uint8_t* src_uv =
+          src_y + static_cast<size_t>(source_width_) * source_height_;
+      uint8_t* dst_y = scaled_nv12_.data();
+      uint8_t* dst_uv =
+          dst_y + static_cast<size_t>(encode_width_) * encode_height_;
+      if (ScaleNv12ViaI420(src_y, source_width_, src_uv, source_width_,
+                           source_width_, source_height_, dst_y, encode_width_,
+                           dst_uv, encode_width_, encode_width_, encode_height_,
+                           libyuv::kFilterBilinear, &scaler_scratch_) != 0) {
+        return E_FAIL;
+      }
+      sample_buffer = scaled_nv12_.data();
+    } else {
+      GetNv12FrameSize(raw.Width(), raw.Height(), &input_size);
+    }
+    HRESULT hr = wmf::CreateSample(sample_buffer, input_size, next_time_,
                                    duration, input);
     if (FAILED(hr)) return hr;
     next_time_ += duration;
@@ -453,9 +530,13 @@ class WmfAv1Encoder::Impl {
   unsigned input_credit_ = 0;
   bool async_ = false, force_idr_ = true, reconfigure_ = false;
   bool initialized_ = false;
+  int source_width_ = 0, source_height_ = 0;
+  int encode_width_ = 0, encode_height_ = 0;
   uint64_t sequence_ = 0;
   LONGLONG next_time_ = 0;
   std::vector<uint8_t> sequence_header_;
+  std::vector<uint8_t> scaled_nv12_;
+  std::vector<uint8_t> scaler_scratch_;
   std::unique_ptr<SvtAv1Encoder> fallback_;
 };
 
@@ -486,6 +567,8 @@ int WmfAv1Encoder::Init(const MediaCodecConfig& config) {
     if (impl_->config_.average_bitrate <= 0) {
       impl_->config_.average_bitrate = impl_->config_.init_bitrate;
     }
+    impl_->source_width_ = impl_->config_.init_width;
+    impl_->source_height_ = impl_->config_.init_height;
     impl_->initialized_ = SUCCEEDED(impl_->Initialize());
     return impl_->initialized_ ? 0 : -1;
   });
@@ -569,8 +652,8 @@ int WmfAv1Encoder::GetResolution(int* width, int* height) const {
   return impl_->worker_.Call([&] {
     if (impl_->fallback_) return impl_->fallback_->GetResolution(width, height);
     if (!impl_->encoder_) return -1;
-    *width = impl_->config_.init_width;
-    *height = impl_->config_.init_height;
+    *width = impl_->encode_width_;
+    *height = impl_->encode_height_;
     return 0;
   });
 }
