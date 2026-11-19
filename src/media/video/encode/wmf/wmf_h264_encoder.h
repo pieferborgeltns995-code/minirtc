@@ -19,6 +19,8 @@ class WmfH264Encoder final : public MediaCodec {
   ~WmfH264Encoder() override;
   static bool IsSupported();
   int Init(const MediaCodecConfig& config) override;
+  bool SupportsNativeFrameInput(
+      MiniRtcNativeVideoFrameType frame_type) const override;
   int Encode(const RawFrame& frame,
              std::function<int(const EncodedFrame&)> callback) override;
   int ForceIdr() override;

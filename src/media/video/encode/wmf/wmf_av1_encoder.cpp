@@ -1,6 +1,8 @@
 #include "wmf_av1_encoder.h"
 
 #include <codecapi.h>
+#include <d3d11.h>
+#include <mfapi.h>
 #include <strmif.h>
 
 #include <algorithm>
@@ -232,11 +234,22 @@ class WmfAv1Encoder::Impl {
   ~Impl() {
     worker_.Call([this] {
       Reset();
+      d3d_device_.Reset();
+      d3d_tex_width_ = 0;
+      d3d_tex_height_ = 0;
       fallback_.reset();
     });
   }
 
   void Reset() {
+    if (encoder_ && using_d3d11_) {
+      encoder_->ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, 0);
+    }
+    dxgi_manager_.Reset();
+    dxgi_reset_token_ = 0;
+    using_d3d11_ = false;
+    reusable_cpu_buffer_.Reset();
+    reusable_cpu_buffer_size_ = 0;
     events_.Reset();
     api_.Reset();
     wmf::ShutdownTransform(encoder_);
@@ -246,7 +259,8 @@ class WmfAv1Encoder::Impl {
     force_idr_ = true;
   }
 
-  HRESULT Configure(IMFActivate* activation, int width, int height) {
+  HRESULT Configure(IMFActivate* activation, int width, int height,
+                    ID3D11Device* d3d_device) {
     HRESULT hr = activation->ActivateObject(IID_PPV_ARGS(&encoder_));
     if (FAILED(hr)) return hr;
     ComPtr<IMFAttributes> attributes;
@@ -259,6 +273,21 @@ class WmfAv1Encoder::Impl {
       if (FAILED(hr)) return hr;
       hr = encoder_.As(&events_);
       if (FAILED(hr)) return hr;
+    }
+    if (d3d_device) {
+      if (MFGetAttributeUINT32(attributes.Get(), MF_SA_D3D11_AWARE, FALSE) ==
+          0) {
+        return MF_E_UNSUPPORTED_D3D_TYPE;
+      }
+      hr = MFCreateDXGIDeviceManager(&dxgi_reset_token_, &dxgi_manager_);
+      if (FAILED(hr)) return hr;
+      hr = dxgi_manager_->ResetDevice(d3d_device, dxgi_reset_token_);
+      if (FAILED(hr)) return hr;
+      hr = encoder_->ProcessMessage(
+          MFT_MESSAGE_SET_D3D_MANAGER,
+          reinterpret_cast<ULONG_PTR>(dxgi_manager_.Get()));
+      if (FAILED(hr)) return hr;
+      using_d3d11_ = true;
     }
     DWORD inputs = 0, outputs = 0;
     hr = encoder_->GetStreamCount(&inputs, &outputs);
@@ -280,11 +309,7 @@ class WmfAv1Encoder::Impl {
       api_->SetValue(&CODECAPI_AVLowLatencyMode, &low_latency);
       SetUint(api_.Get(), CODECAPI_AVEncMPVDefaultBPictureCount, 0);
       SetUint(api_.Get(), CODECAPI_AVEncMPVGOPSize, config_.key_frame_interval);
-      SetUint(api_.Get(), CODECAPI_AVEncCommonQualityVsSpeed,
-              config_.video_degradation_preference ==
-                      MiniRtcVideoDegradationPreference::MaintainFrameRate
-                  ? 0
-                  : 50);
+      SetUint(api_.Get(), CODECAPI_AVEncCommonQualityVsSpeed, 0);
     }
 
     ComPtr<IMFMediaType> output, input;
@@ -313,15 +338,17 @@ class WmfAv1Encoder::Impl {
     input->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12);
     input->DeleteItem(MF_MT_MPEG2_PROFILE);
     input->DeleteItem(MF_MT_AVG_BITRATE);
-    input->SetUINT32(MF_MT_DEFAULT_STRIDE, width);
+    if (!using_d3d11_) {
+      input->SetUINT32(MF_MT_DEFAULT_STRIDE, width);
+    }
     hr = encoder_->SetInputType(input_id_, input.Get(), 0);
-    if (FAILED(hr)) {
+    if (FAILED(hr) && !using_d3d11_) {
       LOG_WARN("WMF AV1 SetInputType failed (0x{:08x}); retrying without stride",
                static_cast<uint32_t>(hr));
       input->DeleteItem(MF_MT_DEFAULT_STRIDE);
       hr = encoder_->SetInputType(input_id_, input.Get(), 0);
-      if (FAILED(hr)) return hr;
     }
+    if (FAILED(hr)) return hr;
 
     if (api_) {
       HRESULT br_hr = SetUint(api_.Get(), CODECAPI_AVEncCommonMeanBitRate,
@@ -348,19 +375,47 @@ class WmfAv1Encoder::Impl {
     for (UINT32 i = 0; i < count; ++i) {
       if (!encoder_) {
         HRESULT last_hr = MF_E_TOPO_CODEC_NOT_FOUND;
-        for (const auto& candidate : candidates) {
-          last_hr = Configure(activations[i], candidate.width, candidate.height);
+        if (d3d_device_ && d3d_tex_width_ > 0 && d3d_tex_height_ > 0) {
+          last_hr = Configure(activations[i], d3d_tex_width_, d3d_tex_height_,
+                              d3d_device_.Get());
           if (SUCCEEDED(last_hr)) {
-            encode_width_ = candidate.width;
-            encode_height_ = candidate.height;
-            encode_mode_ = candidate.mode;
-            break;
+            d3d11_failed_device_ = nullptr;
+            encode_width_ = d3d_tex_width_;
+            encode_height_ = d3d_tex_height_;
+            encode_mode_ = (d3d_tex_width_ != source_width_ ||
+                            d3d_tex_height_ != source_height_)
+                               ? EncodeMode::kPad
+                               : EncodeMode::kNative;
+          } else {
+            LOG_WARN(
+                "Hardware AV1 MFT D3D11 config {}x{} failed (0x{:08x}); "
+                "falling back to CPU buffer input",
+                d3d_tex_width_, d3d_tex_height_,
+                static_cast<uint32_t>(last_hr));
+            d3d11_failed_device_ = d3d_device_.Get();
+            Reset();
+            activations[i]->ShutdownObject();
           }
-          LOG_DEBUG("Hardware AV1 MFT config {}x{} failed: 0x{:08x}",
-                    candidate.width, candidate.height,
-                    static_cast<uint32_t>(last_hr));
-          Reset();
-          activations[i]->ShutdownObject();
+        }
+        if (!encoder_) {
+          d3d_device_.Reset();
+          d3d_tex_width_ = 0;
+          d3d_tex_height_ = 0;
+          for (const auto& candidate : candidates) {
+            last_hr = Configure(activations[i], candidate.width,
+                                candidate.height, nullptr);
+            if (SUCCEEDED(last_hr)) {
+              encode_width_ = candidate.width;
+              encode_height_ = candidate.height;
+              encode_mode_ = candidate.mode;
+              break;
+            }
+            LOG_DEBUG("Hardware AV1 MFT config {}x{} failed: 0x{:08x}",
+                      candidate.width, candidate.height,
+                      static_cast<uint32_t>(last_hr));
+            Reset();
+            activations[i]->ShutdownObject();
+          }
         }
         hr = last_hr;
         if (FAILED(hr)) {
@@ -373,7 +428,8 @@ class WmfAv1Encoder::Impl {
           char utf8[1024]{};
           WideCharToMultiByte(CP_UTF8, 0, name, -1, utf8, sizeof(utf8), nullptr,
                               nullptr);
-          LOG_INFO("Media Foundation hardware AV1 encoder: {}", utf8);
+          LOG_INFO("Media Foundation hardware AV1 encoder{}: {}",
+                   using_d3d11_ ? " (D3D11)" : "", utf8);
           if (encode_mode_ == EncodeMode::kPad) {
             LOG_INFO(
                 "Media Foundation hardware AV1 encoder padding {}x{} -> {}x{} "
@@ -500,16 +556,73 @@ class WmfAv1Encoder::Impl {
     return encode_mode_ == EncodeMode::kScale ? encode_height_ : source_height_;
   }
 
+  const uint8_t* ResolveCpuNv12(const RawFrame& raw) {
+    if (raw.Buffer()) return raw.Buffer();
+    const MiniRtcNativeVideoFrame* native = raw.NativeFrame();
+    if (!native) return nullptr;
+    if (native->type == MiniRtcNativeVideoFrameCpuNv12) {
+      const auto& cpu = native->payload.cpu_nv12;
+      if (cpu.y_plane && cpu.uv_plane && cpu.y_stride == raw.Width() &&
+          cpu.uv_stride == raw.Width() &&
+          cpu.uv_plane ==
+              cpu.y_plane + static_cast<size_t>(raw.Width()) * raw.Height()) {
+        return cpu.y_plane;
+      }
+    }
+    size_t raw_size = 0;
+    if (!GetNv12FrameSize(raw.Width(), raw.Height(), &raw_size)) {
+      return nullptr;
+    }
+    cpu_materialize_buf_.resize(raw_size);
+    if (native->copy_to_nv12(native->owner, cpu_materialize_buf_.data(),
+                             raw_size) != 0) {
+      return nullptr;
+    }
+    return cpu_materialize_buf_.data();
+  }
+
   HRESULT EncodeHardware(const RawFrame& raw,
                          std::vector<EncodedFrame>& frames) {
-    if (static_cast<int>(raw.Width()) != source_width_ ||
-        static_cast<int>(raw.Height()) != source_height_ || reconfigure_) {
-      source_width_ = static_cast<int>(raw.Width());
-      source_height_ = static_cast<int>(raw.Height());
-      config_.init_width = source_width_;
-      config_.init_height = source_height_;
-      HRESULT hr = Initialize();
-      if (FAILED(hr)) return hr;
+    const MiniRtcNativeVideoFrame* native = raw.NativeFrame();
+    const bool is_d3d11_input =
+        native && native->type == MiniRtcNativeVideoFrameD3d11Nv12 &&
+        static_cast<ID3D11Device*>(native->payload.d3d11_nv12.d3d11_device) !=
+            d3d11_failed_device_;
+    if (is_d3d11_input) {
+      auto* dev =
+          static_cast<ID3D11Device*>(native->payload.d3d11_nv12.d3d11_device);
+      const int tex_w =
+          static_cast<int>(native->payload.d3d11_nv12.texture_width);
+      const int tex_h =
+          static_cast<int>(native->payload.d3d11_nv12.texture_height);
+      if (static_cast<int>(raw.Width()) != source_width_ ||
+          static_cast<int>(raw.Height()) != source_height_ || !using_d3d11_ ||
+          dev != d3d_device_.Get() || tex_w != d3d_tex_width_ ||
+          tex_h != d3d_tex_height_ || reconfigure_) {
+        source_width_ = static_cast<int>(raw.Width());
+        source_height_ = static_cast<int>(raw.Height());
+        config_.init_width = source_width_;
+        config_.init_height = source_height_;
+        d3d_device_ = dev;
+        d3d_tex_width_ = tex_w;
+        d3d_tex_height_ = tex_h;
+        HRESULT hr = Initialize();
+        if (FAILED(hr)) return hr;
+      }
+    } else {
+      if (static_cast<int>(raw.Width()) != source_width_ ||
+          static_cast<int>(raw.Height()) != source_height_ || using_d3d11_ ||
+          reconfigure_) {
+        source_width_ = static_cast<int>(raw.Width());
+        source_height_ = static_cast<int>(raw.Height());
+        config_.init_width = source_width_;
+        config_.init_height = source_height_;
+        d3d_device_.Reset();
+        d3d_tex_width_ = 0;
+        d3d_tex_height_ = 0;
+        HRESULT hr = Initialize();
+        if (FAILED(hr)) return hr;
+      }
     }
     if (!encoder_) return MF_E_NOT_INITIALIZED;
     if (sequence_ % config_.key_frame_interval == 0) force_idr_ = true;
@@ -520,58 +633,103 @@ class WmfAv1Encoder::Impl {
                   static_cast<uint32_t>(kf_hr));
       }
     }
+
     ComPtr<IMFSample> input;
     const LONGLONG duration = 10'000'000LL / config_.max_frame_rate;
-    const uint8_t* sample_buffer = raw.Buffer();
-    size_t input_size = 0;
-    if (encode_mode_ == EncodeMode::kPad) {
-      if (!GetNv12FrameSize(encode_width_, encode_height_, &input_size)) {
-        return E_INVALIDARG;
+    HRESULT hr = S_OK;
+    if (is_d3d11_input && using_d3d11_) {
+      auto* tex =
+          static_cast<ID3D11Texture2D*>(native->payload.d3d11_nv12.texture);
+      ComPtr<IMFMediaBuffer> dxgi_buffer;
+      hr = MFCreateDXGISurfaceBuffer(
+          __uuidof(ID3D11Texture2D), tex,
+          native->payload.d3d11_nv12.subresource_index, FALSE, &dxgi_buffer);
+      if (FAILED(hr)) return hr;
+      DWORD max_len = 0;
+      if (SUCCEEDED(dxgi_buffer->GetMaxLength(&max_len)) && max_len > 0) {
+        dxgi_buffer->SetCurrentLength(max_len);
       }
-      scaled_nv12_.resize(input_size);
-      if (!PadNv12EdgeClamp(raw.Buffer(), source_width_, source_height_,
-                            scaled_nv12_.data(), encode_width_,
-                            encode_height_)) {
-        return E_FAIL;
-      }
-      sample_buffer = scaled_nv12_.data();
-    } else if (encode_mode_ == EncodeMode::kScale) {
-      if (!GetNv12FrameSize(encode_width_, encode_height_, &input_size)) {
-        return E_INVALIDARG;
-      }
-      scaled_nv12_.resize(input_size);
-      const uint8_t* src_y = raw.Buffer();
-      const uint8_t* src_uv =
-          src_y + static_cast<size_t>(source_width_) * source_height_;
-      uint8_t* dst_y = scaled_nv12_.data();
-      uint8_t* dst_uv =
-          dst_y + static_cast<size_t>(encode_width_) * encode_height_;
-      if (ScaleNv12ViaI420(src_y, source_width_, src_uv, source_width_,
-                           source_width_, source_height_, dst_y, encode_width_,
-                           dst_uv, encode_width_, encode_width_, encode_height_,
-                           libyuv::kFilterBilinear, &scaler_scratch_) != 0) {
-        return E_FAIL;
-      }
-      sample_buffer = scaled_nv12_.data();
+      hr = MFCreateSample(&input);
+      if (FAILED(hr)) return hr;
+      hr = input->AddBuffer(dxgi_buffer.Get());
+      if (FAILED(hr)) return hr;
+      hr = input->SetSampleTime(next_time_);
+      if (FAILED(hr)) return hr;
+      hr = input->SetSampleDuration(duration);
+      if (FAILED(hr)) return hr;
     } else {
-      GetNv12FrameSize(raw.Width(), raw.Height(), &input_size);
+      const uint8_t* src_nv12 = ResolveCpuNv12(raw);
+      if (!src_nv12) return E_INVALIDARG;
+      size_t input_size = 0;
+      if (!GetNv12FrameSize(encode_width_, encode_height_, &input_size)) {
+        return E_INVALIDARG;
+      }
+      if (!reusable_cpu_buffer_ || reusable_cpu_buffer_size_ < input_size) {
+        reusable_cpu_buffer_.Reset();
+        hr = MFCreateMemoryBuffer(static_cast<DWORD>(input_size),
+                                  &reusable_cpu_buffer_);
+        if (FAILED(hr)) return hr;
+        reusable_cpu_buffer_size_ = static_cast<DWORD>(input_size);
+      }
+      BYTE* dst = nullptr;
+      hr = reusable_cpu_buffer_->Lock(&dst, nullptr, nullptr);
+      if (FAILED(hr)) return hr;
+      bool prepared = true;
+      if (encode_mode_ == EncodeMode::kPad) {
+        prepared = PadNv12EdgeClamp(src_nv12, source_width_, source_height_,
+                                    dst, encode_width_, encode_height_);
+      } else if (encode_mode_ == EncodeMode::kScale) {
+        const uint8_t* src_y = src_nv12;
+        const uint8_t* src_uv =
+            src_y + static_cast<size_t>(source_width_) * source_height_;
+        uint8_t* dst_y = dst;
+        uint8_t* dst_uv =
+            dst_y + static_cast<size_t>(encode_width_) * encode_height_;
+        prepared =
+            ScaleNv12ViaI420(src_y, source_width_, src_uv, source_width_,
+                             source_width_, source_height_, dst_y,
+                             encode_width_, dst_uv, encode_width_,
+                             encode_width_, encode_height_,
+                             libyuv::kFilterBilinear, &scaler_scratch_) == 0;
+      } else {
+        std::memcpy(dst, src_nv12, input_size);
+      }
+      reusable_cpu_buffer_->Unlock();
+      if (!prepared) return E_FAIL;
+      hr = reusable_cpu_buffer_->SetCurrentLength(
+          static_cast<DWORD>(input_size));
+      if (FAILED(hr)) return hr;
+      hr = MFCreateSample(&input);
+      if (FAILED(hr)) return hr;
+      hr = input->AddBuffer(reusable_cpu_buffer_.Get());
+      if (FAILED(hr)) return hr;
+      hr = input->SetSampleTime(next_time_);
+      if (FAILED(hr)) return hr;
+      hr = input->SetSampleDuration(duration);
+      if (FAILED(hr)) return hr;
     }
-    HRESULT hr = wmf::CreateSample(sample_buffer, input_size, next_time_,
-                                   duration, input);
-    if (FAILED(hr)) return hr;
     next_time_ += duration;
     const auto deadline =
         std::chrono::steady_clock::now() + std::chrono::seconds(2);
     bool submitted = false;
     while (std::chrono::steady_clock::now() < deadline) {
+      if (!submitted && (!async_ || input_credit_ > 0)) {
+        hr = encoder_->ProcessInput(input_id_, input.Get(), 0);
+        if (SUCCEEDED(hr)) {
+          submitted = true;
+          if (async_) --input_credit_;
+        } else if (hr != MF_E_NOTACCEPTING) {
+          return hr;
+        }
+      }
       bool have_output = !async_;
-      bool received_event = false;
       if (async_) {
         ComPtr<IMFMediaEvent> event;
-        hr = events_->GetEvent(MF_EVENT_FLAG_NO_WAIT, &event);
+        const DWORD wait_flag =
+            (!submitted && input_credit_ > 0) ? MF_EVENT_FLAG_NO_WAIT : 0;
+        hr = events_->GetEvent(wait_flag, &event);
         if (hr != MF_E_NO_EVENTS_AVAILABLE) {
           if (FAILED(hr)) return hr;
-          received_event = true;
           HRESULT status = S_OK;
           hr = event->GetStatus(&status);
           if (FAILED(hr)) return hr;
@@ -581,15 +739,6 @@ class WmfAv1Encoder::Impl {
           if (FAILED(hr)) return hr;
           if (type == METransformNeedInput) ++input_credit_;
           if (type == METransformHaveOutput) have_output = true;
-        }
-      }
-      if (!submitted && (!async_ || input_credit_)) {
-        hr = encoder_->ProcessInput(input_id_, input.Get(), 0);
-        if (SUCCEEDED(hr)) {
-          submitted = true;
-          if (async_) --input_credit_;
-        } else if (hr != MF_E_NOTACCEPTING) {
-          return hr;
         }
       }
       if (have_output) {
@@ -612,7 +761,7 @@ class WmfAv1Encoder::Impl {
           return S_OK;
         }
       }
-      if (!received_event) {
+      if (!async_) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
       }
     }
@@ -625,6 +774,14 @@ class WmfAv1Encoder::Impl {
   ComPtr<IMFTransform> encoder_;
   ComPtr<IMFMediaEventGenerator> events_;
   ComPtr<ICodecAPI> api_;
+  ComPtr<ID3D11Device> d3d_device_;
+  ID3D11Device* d3d11_failed_device_ = nullptr;
+  ComPtr<IMFDXGIDeviceManager> dxgi_manager_;
+  UINT dxgi_reset_token_ = 0;
+  bool using_d3d11_ = false;
+  int d3d_tex_width_ = 0, d3d_tex_height_ = 0;
+  ComPtr<IMFMediaBuffer> reusable_cpu_buffer_;
+  DWORD reusable_cpu_buffer_size_ = 0;
   DWORD input_id_ = 0, output_id_ = 0;
   unsigned input_credit_ = 0;
   bool async_ = false, force_idr_ = true, reconfigure_ = false;
@@ -635,7 +792,7 @@ class WmfAv1Encoder::Impl {
   uint64_t sequence_ = 0;
   LONGLONG next_time_ = 0;
   std::vector<uint8_t> sequence_header_;
-  std::vector<uint8_t> scaled_nv12_;
+  std::vector<uint8_t> cpu_materialize_buf_;
   std::vector<uint8_t> scaler_scratch_;
   std::unique_ptr<SvtAv1Encoder> fallback_;
 };
@@ -669,16 +826,27 @@ int WmfAv1Encoder::Init(const MediaCodecConfig& config) {
     }
     impl_->source_width_ = impl_->config_.init_width;
     impl_->source_height_ = impl_->config_.init_height;
+    impl_->d3d_device_.Reset();
+    impl_->d3d_tex_width_ = 0;
+    impl_->d3d_tex_height_ = 0;
     impl_->initialized_ = SUCCEEDED(impl_->Initialize());
     return impl_->initialized_ ? 0 : -1;
   });
 }
 
+bool WmfAv1Encoder::SupportsNativeFrameInput(
+    MiniRtcNativeVideoFrameType frame_type) const {
+  return frame_type == MiniRtcNativeVideoFrameD3d11Nv12 ||
+         frame_type == MiniRtcNativeVideoFrameCpuNv12;
+}
+
 int WmfAv1Encoder::Encode(const RawFrame& raw,
                           std::function<int(const EncodedFrame&)> callback) {
   size_t size = 0;
-  if (!raw.Buffer() || raw.Width() > 8192 || raw.Height() > 8192 ||
-      !GetNv12FrameSize(raw.Width(), raw.Height(), &size) || raw.Size() < size)
+  if (raw.Width() == 0 || raw.Height() == 0 || raw.Width() > 8192 ||
+      raw.Height() > 8192 ||
+      !GetNv12FrameSize(raw.Width(), raw.Height(), &size) ||
+      (!raw.NativeFrame() && (!raw.Buffer() || raw.Size() < size)))
     return -1;
   std::vector<EncodedFrame> frames;
   const int result = impl_->worker_.Call([&] {
@@ -691,16 +859,24 @@ int WmfAv1Encoder::Encode(const RawFrame& raw,
           "back to SVT-AV1",
           static_cast<uint32_t>(hr));
       impl_->Reset();
+      impl_->d3d_device_.Reset();
+      impl_->d3d_tex_width_ = 0;
+      impl_->d3d_tex_height_ = 0;
       impl_->fallback_ = std::make_unique<SvtAv1Encoder>(impl_->clock_);
       if (impl_->fallback_->Init(impl_->config_) != 0) {
         impl_->fallback_.reset();
         return -1;
       }
     }
-    return impl_->fallback_->Encode(raw, [&](const EncodedFrame& frame) {
-      frames.push_back(frame);
-      return 0;
-    });
+    RawFrame fallback_raw = raw;
+    if (fallback_raw.NativeFrame() && !fallback_raw.MaterializeNativeFrame()) {
+      return -1;
+    }
+    return impl_->fallback_->Encode(
+        fallback_raw, [&](const EncodedFrame& frame) {
+          frames.push_back(frame);
+          return 0;
+        });
   });
   for (const auto& frame : frames)
     if (callback) callback(frame);

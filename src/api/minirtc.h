@@ -182,6 +182,8 @@ enum MiniRtcNativeVideoFrameType : uint32_t {
   MiniRtcNativeVideoFrameCVPixelBuffer = 3,
   /// Output-only Surface buffer.
   MiniRtcNativeVideoFrameAndroidMediaCodec = 4,
+  /// Direct3D 11 device-memory NV12 texture.
+  MiniRtcNativeVideoFrameD3d11Nv12 = 5,
 };
 
 /// NV12 planes in CPU memory. Strides are bytes per row, including padding.
@@ -219,6 +221,20 @@ typedef struct {
   int (*render)(void* owner, void* native_window);
 } MiniRtcAndroidMediaCodecFrame;
 
+/// NV12 texture in Direct3D 11 device memory.
+typedef struct {
+  /// Borrowed ID3D11Device* that owns texture.
+  void* d3d11_device;
+  /// Borrowed ID3D11Texture2D* with DXGI_FORMAT_NV12.
+  void* texture;
+  /// Subresource index within texture (typically 0).
+  uint32_t subresource_index;
+  /// Physical texture width in pixels (>= frame width, e.g. 64-aligned).
+  uint32_t texture_width;
+  /// Physical texture height in pixels (>= frame height, e.g. 16-aligned).
+  uint32_t texture_height;
+} MiniRtcD3d11Nv12Frame;
+
 /// Access only the member named by MiniRtcNativeVideoFrame::type.
 typedef union {
   MiniRtcCpuNv12Frame cpu_nv12;
@@ -226,6 +242,7 @@ typedef union {
   MiniRtcCudaNv12Frame cuda_nv12;
   /// NV12 CVPixelBufferRef; use Apple APIs for plane access.
   void* cv_pixel_buffer;
+  MiniRtcD3d11Nv12Frame d3d11_nv12;
 } MiniRtcNativeVideoFramePayload;
 
 /**

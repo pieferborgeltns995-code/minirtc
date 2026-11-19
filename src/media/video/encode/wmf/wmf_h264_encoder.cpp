@@ -94,11 +94,7 @@ class WmfH264Encoder::Impl {
     api_->SetValue(&CODECAPI_AVLowLatencyMode, &low_latency);
     SetUint(api_.Get(), CODECAPI_AVEncMPVDefaultBPictureCount, 0);
     SetUint(api_.Get(), CODECAPI_AVEncMPVGOPSize, config_.key_frame_interval);
-    SetUint(api_.Get(), CODECAPI_AVEncCommonQualityVsSpeed,
-            config_.video_degradation_preference ==
-                    MiniRtcVideoDegradationPreference::MaintainFrameRate
-                ? 0
-                : 50);
+    SetUint(api_.Get(), CODECAPI_AVEncCommonQualityVsSpeed, 0);
 
     ComPtr<IMFMediaType> output, input;
     hr = MFCreateMediaType(&output);
@@ -257,14 +253,22 @@ class WmfH264Encoder::Impl {
     // next one. A bounded wait also handles driver/device loss without hanging
     // the media thread. No callbacks or input references escape Encode().
     while (std::chrono::steady_clock::now() < deadline) {
+      if (!submitted && (!async_ || input_credit_)) {
+        hr = encoder_->ProcessInput(input_id_, input.Get(), 0);
+        if (SUCCEEDED(hr)) {
+          submitted = true;
+          if (async_) --input_credit_;
+        } else if (hr != MF_E_NOTACCEPTING)
+          return hr;
+      }
       bool have_output = !async_;
-      bool received_event = false;
       if (async_) {
         ComPtr<IMFMediaEvent> event;
-        hr = events_->GetEvent(MF_EVENT_FLAG_NO_WAIT, &event);
+        const DWORD wait_flag =
+            (!submitted && input_credit_ > 0) ? MF_EVENT_FLAG_NO_WAIT : 0;
+        hr = events_->GetEvent(wait_flag, &event);
         if (hr != MF_E_NO_EVENTS_AVAILABLE) {
           if (FAILED(hr)) return hr;
-          received_event = true;
           HRESULT status = S_OK;
           hr = event->GetStatus(&status);
           if (FAILED(hr)) return hr;
@@ -275,14 +279,6 @@ class WmfH264Encoder::Impl {
           if (type == METransformNeedInput) ++input_credit_;
           if (type == METransformHaveOutput) have_output = true;
         }
-      }
-      if (!submitted && (!async_ || input_credit_)) {
-        hr = encoder_->ProcessInput(input_id_, input.Get(), 0);
-        if (SUCCEEDED(hr)) {
-          submitted = true;
-          if (async_) --input_credit_;
-        } else if (hr != MF_E_NOTACCEPTING)
-          return hr;
       }
       if (have_output) {
         ComPtr<IMFSample> output;
@@ -307,9 +303,7 @@ class WmfH264Encoder::Impl {
           return S_OK;
         }
       }
-      // Drain queued notifications without adding a timer delay per event.
-      // Only poll with a delay when idle; keep the bounded wait above.
-      if (!received_event)
+      if (!async_)
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     return HRESULT_FROM_WIN32(WAIT_TIMEOUT);
@@ -361,17 +355,48 @@ int WmfH264Encoder::Init(const MediaCodecConfig& config) {
   });
 }
 
+bool WmfH264Encoder::SupportsNativeFrameInput(
+    MiniRtcNativeVideoFrameType frame_type) const {
+  return frame_type == MiniRtcNativeVideoFrameCpuNv12 ||
+         frame_type == MiniRtcNativeVideoFrameD3d11Nv12;
+}
+
 int WmfH264Encoder::Encode(const RawFrame& raw,
                            std::function<int(const EncodedFrame&)> callback) {
   size_t size = 0;
-  if (!raw.Buffer() || raw.Width() > 8192 || raw.Height() > 8192 ||
-      !GetNv12FrameSize(raw.Width(), raw.Height(), &size) || raw.Size() < size)
+  if (raw.Width() == 0 || raw.Height() == 0 || raw.Width() > 8192 ||
+      raw.Height() > 8192 ||
+      !GetNv12FrameSize(raw.Width(), raw.Height(), &size) ||
+      (!raw.NativeFrame() && (!raw.Buffer() || raw.Size() < size)))
     return -1;
+  RawFrame prepared;
+  const RawFrame* input_raw = &raw;
+  if (!raw.Buffer()) {
+    const MiniRtcNativeVideoFrame* native = raw.NativeFrame();
+    if (!native) return -1;
+    if (native->type == MiniRtcNativeVideoFrameCpuNv12 &&
+        native->payload.cpu_nv12.y_plane &&
+        native->payload.cpu_nv12.uv_plane &&
+        native->payload.cpu_nv12.y_stride == raw.Width() &&
+        native->payload.cpu_nv12.uv_stride == raw.Width() &&
+        native->payload.cpu_nv12.uv_plane ==
+            native->payload.cpu_nv12.y_plane +
+                static_cast<size_t>(raw.Width()) * raw.Height()) {
+      prepared = RawFrame(native->payload.cpu_nv12.y_plane, size, raw.Width(),
+                          raw.Height());
+      prepared.SetCapturedTimestamp(raw.CapturedTimestamp());
+      input_raw = &prepared;
+    } else {
+      prepared = raw;
+      if (!prepared.MaterializeNativeFrame()) return -1;
+      input_raw = &prepared;
+    }
+  }
   std::vector<EncodedFrame> frames;
   const int result = impl_->worker_.Call([&] {
     if (!impl_->initialized_) return -1;
     if (!impl_->fallback_) {
-      const HRESULT hr = impl_->EncodeHardware(raw, frames);
+      const HRESULT hr = impl_->EncodeHardware(*input_raw, frames);
       if (SUCCEEDED(hr)) return 0;
       LOG_WARN(
           "Media Foundation hardware encoding failed (0x{:08x}); using "
@@ -384,7 +409,7 @@ int WmfH264Encoder::Encode(const RawFrame& raw,
         return -1;
       }
     }
-    return impl_->fallback_->Encode(raw, [&](const EncodedFrame& frame) {
+    return impl_->fallback_->Encode(*input_raw, [&](const EncodedFrame& frame) {
       frames.push_back(frame);
       return 0;
     });

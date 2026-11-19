@@ -60,6 +60,15 @@ inline const MiniRtcNativeVideoFrame* GetNativeVideoFrame(
                  : nullptr;
     case MiniRtcNativeVideoFrameCVPixelBuffer:
       return frame->payload.cv_pixel_buffer ? frame : nullptr;
+    case MiniRtcNativeVideoFrameD3d11Nv12:
+      return frame->payload.d3d11_nv12.d3d11_device &&
+                     frame->payload.d3d11_nv12.texture &&
+                     frame->payload.d3d11_nv12.texture_width >= frame->width &&
+                     frame->payload.d3d11_nv12.texture_height >= frame->height &&
+                     (frame->payload.d3d11_nv12.texture_width & 1U) == 0 &&
+                     (frame->payload.d3d11_nv12.texture_height & 1U) == 0
+                 ? frame
+                 : nullptr;
     case MiniRtcNativeVideoFrameNone:
     default:
       return nullptr;
