@@ -17,8 +17,9 @@ namespace minirtc {
 class VideoFrameCadence {
  public:
   bool Accept(int64_t now_us, int frame_rate) {
-    if (now_us + 1000 < next_frame_us_) return false;
-    const int64_t interval_us = 1000000 / frame_rate;
+    const int64_t interval_us = 1000000 / std::max(1, frame_rate);
+    const int64_t tolerance_us = std::min<int64_t>(4000, interval_us / 4);
+    if (now_us + tolerance_us < next_frame_us_) return false;
     next_frame_us_ =
         next_frame_us_ == 0
             ? now_us + interval_us

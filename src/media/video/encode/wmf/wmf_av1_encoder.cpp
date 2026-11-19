@@ -245,6 +245,8 @@ class WmfAv1Encoder::Impl {
     if (encoder_ && using_d3d11_) {
       encoder_->ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, 0);
     }
+    dxgi_buffer_cache_.clear();
+    reusable_input_sample_.Reset();
     dxgi_manager_.Reset();
     dxgi_reset_token_ = 0;
     using_d3d11_ = false;
@@ -257,6 +259,52 @@ class WmfAv1Encoder::Impl {
     sequence_header_.clear();
     sequence_ = 0;
     force_idr_ = true;
+  }
+
+  HRESULT GetOrCreateDxgiBuffer(ID3D11Texture2D* tex, uint32_t subresource,
+                                ComPtr<IMFMediaBuffer>& out_buffer) {
+    if (!tex) return E_INVALIDARG;
+    for (auto& entry : dxgi_buffer_cache_) {
+      if (entry.texture == tex && entry.subresource == subresource) {
+        out_buffer = entry.buffer;
+        return S_OK;
+      }
+    }
+    ComPtr<IMFMediaBuffer> dxgi_buffer;
+    HRESULT hr = MFCreateDXGISurfaceBuffer(
+        __uuidof(ID3D11Texture2D), tex, subresource, FALSE, &dxgi_buffer);
+    if (FAILED(hr)) return hr;
+    DWORD max_len = 0;
+    if (SUCCEEDED(dxgi_buffer->GetMaxLength(&max_len)) && max_len > 0) {
+      dxgi_buffer->SetCurrentLength(max_len);
+    }
+    if (dxgi_buffer_cache_.size() >= 8) {
+      dxgi_buffer_cache_.erase(dxgi_buffer_cache_.begin());
+    }
+    dxgi_buffer_cache_.push_back({tex, subresource, dxgi_buffer});
+    out_buffer = std::move(dxgi_buffer);
+    return S_OK;
+  }
+
+  HRESULT PrepareInputSample(IMFMediaBuffer* buffer, LONGLONG sample_time,
+                             LONGLONG duration, ComPtr<IMFSample>& out_sample) {
+    if (!buffer) return E_INVALIDARG;
+    HRESULT hr = S_OK;
+    if (!reusable_input_sample_) {
+      hr = MFCreateSample(&reusable_input_sample_);
+      if (FAILED(hr)) return hr;
+    } else {
+      hr = reusable_input_sample_->RemoveAllBuffers();
+      if (FAILED(hr)) return hr;
+    }
+    hr = reusable_input_sample_->AddBuffer(buffer);
+    if (FAILED(hr)) return hr;
+    hr = reusable_input_sample_->SetSampleTime(sample_time);
+    if (FAILED(hr)) return hr;
+    hr = reusable_input_sample_->SetSampleDuration(duration);
+    if (FAILED(hr)) return hr;
+    out_sample = reusable_input_sample_;
+    return S_OK;
   }
 
   HRESULT Configure(IMFActivate* activation, int width, int height,
@@ -642,21 +690,10 @@ class WmfAv1Encoder::Impl {
       auto* tex =
           static_cast<ID3D11Texture2D*>(native->payload.d3d11_nv12.texture);
       ComPtr<IMFMediaBuffer> dxgi_buffer;
-      hr = MFCreateDXGISurfaceBuffer(
-          __uuidof(ID3D11Texture2D), tex,
-          native->payload.d3d11_nv12.subresource_index, FALSE, &dxgi_buffer);
+      hr = GetOrCreateDxgiBuffer(
+          tex, native->payload.d3d11_nv12.subresource_index, dxgi_buffer);
       if (FAILED(hr)) return hr;
-      DWORD max_len = 0;
-      if (SUCCEEDED(dxgi_buffer->GetMaxLength(&max_len)) && max_len > 0) {
-        dxgi_buffer->SetCurrentLength(max_len);
-      }
-      hr = MFCreateSample(&input);
-      if (FAILED(hr)) return hr;
-      hr = input->AddBuffer(dxgi_buffer.Get());
-      if (FAILED(hr)) return hr;
-      hr = input->SetSampleTime(next_time_);
-      if (FAILED(hr)) return hr;
-      hr = input->SetSampleDuration(duration);
+      hr = PrepareInputSample(dxgi_buffer.Get(), next_time_, duration, input);
       if (FAILED(hr)) return hr;
     } else {
       const uint8_t* src_nv12 = ResolveCpuNv12(raw);
@@ -700,15 +737,16 @@ class WmfAv1Encoder::Impl {
       hr = reusable_cpu_buffer_->SetCurrentLength(
           static_cast<DWORD>(input_size));
       if (FAILED(hr)) return hr;
-      hr = MFCreateSample(&input);
-      if (FAILED(hr)) return hr;
-      hr = input->AddBuffer(reusable_cpu_buffer_.Get());
-      if (FAILED(hr)) return hr;
-      hr = input->SetSampleTime(next_time_);
-      if (FAILED(hr)) return hr;
-      hr = input->SetSampleDuration(duration);
+      hr = PrepareInputSample(reusable_cpu_buffer_.Get(), next_time_, duration,
+                              input);
       if (FAILED(hr)) return hr;
     }
+    struct SampleBufferScope {
+      IMFSample* sample = nullptr;
+      ~SampleBufferScope() {
+        if (sample) sample->RemoveAllBuffers();
+      }
+    } sample_scope{input.Get()};
     next_time_ += duration;
     const auto deadline =
         std::chrono::steady_clock::now() + std::chrono::seconds(2);
@@ -792,6 +830,13 @@ class WmfAv1Encoder::Impl {
   UINT dxgi_reset_token_ = 0;
   bool using_d3d11_ = false;
   int d3d_tex_width_ = 0, d3d_tex_height_ = 0;
+  struct CachedDxgiBuffer {
+    ID3D11Texture2D* texture = nullptr;
+    uint32_t subresource = 0;
+    ComPtr<IMFMediaBuffer> buffer;
+  };
+  std::vector<CachedDxgiBuffer> dxgi_buffer_cache_;
+  ComPtr<IMFSample> reusable_input_sample_;
   ComPtr<IMFMediaBuffer> reusable_cpu_buffer_;
   DWORD reusable_cpu_buffer_size_ = 0;
   DWORD input_id_ = 0, output_id_ = 0;
