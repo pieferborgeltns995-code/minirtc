@@ -46,6 +46,8 @@ class Dav1dAv1Decoder : public MediaCodec {
 
   uint32_t frame_width_ = 0;
   uint32_t frame_height_ = 0;
+  uint32_t crop_width_ = 0;
+  uint32_t crop_height_ = 0;
 
   FILE* file_av1_ = nullptr;
   FILE* file_nv12_ = nullptr;
