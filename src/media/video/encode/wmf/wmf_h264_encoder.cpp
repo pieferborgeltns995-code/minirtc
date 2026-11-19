@@ -276,7 +276,17 @@ class WmfH264Encoder::Impl {
           MediaEventType type = MEUnknown;
           hr = event->GetType(&type);
           if (FAILED(hr)) return hr;
-          if (type == METransformNeedInput) ++input_credit_;
+          if (type == METransformNeedInput) {
+            ++input_credit_;
+            if (!submitted && input_credit_ > 0) {
+              hr = encoder_->ProcessInput(input_id_, input.Get(), 0);
+              if (SUCCEEDED(hr)) {
+                submitted = true;
+                --input_credit_;
+              } else if (hr != MF_E_NOTACCEPTING)
+                return hr;
+            }
+          }
           if (type == METransformHaveOutput) have_output = true;
         }
       }

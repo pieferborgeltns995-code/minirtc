@@ -462,9 +462,10 @@ class WmfAv1Encoder::Impl {
 
   HRESULT ReadFrame(IMFSample* sample, const RawFrame& raw,
                     std::vector<EncodedFrame>& frames) {
-    std::vector<uint8_t> bytes;
-    HRESULT hr = wmf::ReadBytes(sample, bytes);
+    output_bytes_.clear();
+    HRESULT hr = wmf::ReadBytes(sample, output_bytes_);
     if (FAILED(hr)) return hr;
+    auto& bytes = output_bytes_;
     if (bytes.empty()) return MF_E_INVALID_STREAM_DATA;
 
     const auto obus = ParseAv1Obus(bytes.data(), bytes.size());
@@ -737,7 +738,18 @@ class WmfAv1Encoder::Impl {
           MediaEventType type = MEUnknown;
           hr = event->GetType(&type);
           if (FAILED(hr)) return hr;
-          if (type == METransformNeedInput) ++input_credit_;
+          if (type == METransformNeedInput) {
+            ++input_credit_;
+            if (!submitted && input_credit_ > 0) {
+              hr = encoder_->ProcessInput(input_id_, input.Get(), 0);
+              if (SUCCEEDED(hr)) {
+                submitted = true;
+                --input_credit_;
+              } else if (hr != MF_E_NOTACCEPTING) {
+                return hr;
+              }
+            }
+          }
           if (type == METransformHaveOutput) have_output = true;
         }
       }
@@ -792,6 +804,7 @@ class WmfAv1Encoder::Impl {
   uint64_t sequence_ = 0;
   LONGLONG next_time_ = 0;
   std::vector<uint8_t> sequence_header_;
+  std::vector<uint8_t> output_bytes_;
   std::vector<uint8_t> cpu_materialize_buf_;
   std::vector<uint8_t> scaler_scratch_;
   std::unique_ptr<SvtAv1Encoder> fallback_;
