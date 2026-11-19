@@ -75,6 +75,14 @@ std::unique_ptr<MediaCodec> VideoDecoderFactory::CreateVideoDecoder(
   }
 #endif
   if (codec_type == VideoCodecType::AV1) {
+#if defined(__APPLE__) && !defined(MINIRTC_IOS)
+    if (hardware_acceleration &&
+        CheckIsHardwareAccelerationSupported(VideoCodecType::AV1)) {
+      LOG_INFO("Hardware AV1 decoding is supported; using VideoToolbox");
+      return std::make_unique<VideoToolboxDecoder>(clock, native_video_output,
+                                                   VideoCodecType::AV1);
+    }
+#endif
     if (hardware_acceleration) {
       LOG_INFO(
           "Hardware AV1 decoding is not supported; using the dav1d "
@@ -154,7 +162,9 @@ std::unique_ptr<MediaCodec> VideoDecoderFactory::CreateInitializedVideoDecoder(
       clock, hardware_acceleration, codec_type, native_video_output));
   if (decoder) return decoder;
 #if !defined(MINIRTC_IOS)
-  if (hardware_acceleration && codec_type == VideoCodecType::H264) {
+  if (hardware_acceleration &&
+      (codec_type == VideoCodecType::H264 ||
+       codec_type == VideoCodecType::AV1)) {
     return TryInitDecoder(
         CreateVideoDecoder(clock, false, codec_type, native_video_output));
   }
@@ -169,6 +179,14 @@ bool VideoDecoderFactory::CheckIsHardwareAccelerationSupported(
 #endif
 #if defined(__ANDROID__)
   return !FindAndroidCodecs(codec_type, false).empty();
+#elif defined(__APPLE__)
+  if (codec_type == VideoCodecType::H264) {
+    return VTIsHardwareDecodeSupported(kCMVideoCodecType_H264);
+  }
+  if (codec_type == VideoCodecType::AV1) {
+    return VTIsHardwareDecodeSupported(kCMVideoCodecType_AV1);
+  }
+  return false;
 #else
   if (codec_type != VideoCodecType::H264) {
     return false;
@@ -178,8 +196,6 @@ bool VideoDecoderFactory::CheckIsHardwareAccelerationSupported(
   if (CheckIsCudaDecodeSupported()) return true;
 #endif
   return D3D11H264Decoder::IsSupported();
-#elif defined(__APPLE__)
-  return VTIsHardwareDecodeSupported(kCMVideoCodecType_H264);
 #elif MINIRTC_HAS_CUDA_DECODER
   return CheckIsCudaDecodeSupported();
 #else
