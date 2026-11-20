@@ -15,10 +15,13 @@ namespace minirtc {
 
 class VideoToolboxDecoder : public MediaCodec {
  public:
-  explicit VideoToolboxDecoder(std::shared_ptr<SystemClock> clock,
-                               bool native_video_output = false);
+  explicit VideoToolboxDecoder(
+      std::shared_ptr<SystemClock> clock,
+      bool native_video_output = false,
+      VideoCodecType codec_type = VideoCodecType::H264);
   ~VideoToolboxDecoder();
 
+  static bool IsHevcSupported();
   int Init() override;
   int Decode(std::unique_ptr<ReceivedFrame> received_frame,
              std::function<void(const DecodedFrame*)> on_receive_decoded_frame)

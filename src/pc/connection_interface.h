@@ -41,6 +41,7 @@ struct ConnectionInfo {
   bool enable_srtp;
   MiniRtcVideoContentType video_content_type;
   bool av1_encoding;
+  MiniRtcVideoCodec video_codec = MiniRtcVideoCodecDefault;
   MiniRtcVideoQuality video_quality;
   int video_frame_rate;
   MiniRtcVideoDegradationPreference video_degradation_preference;

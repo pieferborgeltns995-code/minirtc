@@ -106,6 +106,7 @@ class VideoChannelSend : public MediaChannel {
   uint32_t ssrc_ = 0;
   uint32_t rtx_ssrc_ = 0;
   bool rtx_enabled_ = false;
+  rtp::PAYLOAD_TYPE media_payload_type_ = rtp::PAYLOAD_TYPE::H264;
   bool fec_enabled_ = false;
   struct FecSendState;
   std::shared_ptr<FecSendState> fec_state_;

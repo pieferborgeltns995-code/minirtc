@@ -170,6 +170,15 @@ enum class MiniRtcVideoDegradationPreference : uint8_t {
   Balanced = 2,
 };
 
+/// Preferred video codec for native MiniRTC sessions.
+typedef enum MiniRtcVideoCodec {
+  /// Follow legacy MiniRtcParams::av1_encoding (false = H.264, true = AV1).
+  MiniRtcVideoCodecDefault = 0,
+  MiniRtcVideoCodecH264 = 1,
+  MiniRtcVideoCodecAV1 = 2,
+  MiniRtcVideoCodecHEVC = 3
+} MiniRtcVideoCodec;
+
 /// Tag selecting exactly one MiniRtcNativeVideoFramePayload member.
 enum MiniRtcNativeVideoFrameType : uint32_t {
   /// No native payload.
@@ -568,6 +577,8 @@ typedef struct {
   MiniRtcOnSignalExchange on_signal_exchange;
   /// Optional native H.264 tap.
   MiniRtcOnReceiveEncodedVideo on_receive_encoded_video;
+  /// Preferred native video codec. MiniRtcVideoCodecDefault follows av1_encoding.
+  MiniRtcVideoCodec video_codec;
 } MiniRtcParams;
 
 // -----------------------------------------------------------------------------
@@ -683,6 +694,13 @@ MINIRTC_API int MiniRtcInit(MiniRtcPeerPtr* peer_ptr);
  */
 MINIRTC_API int MiniRtcUpdateConnectionSettings(MiniRtcPeerPtr* peer_ptr,
     bool hardware_acceleration, bool av1_encoding, MiniRtcTurnMode turn_mode);
+
+/**
+ * @brief Update codec (H.264 / AV1 / HEVC) and ICE defaults without reconnecting signaling.
+ */
+MINIRTC_API int MiniRtcUpdateConnectionSettingsEx(MiniRtcPeerPtr* peer_ptr,
+    bool hardware_acceleration, MiniRtcVideoCodec video_codec,
+    MiniRtcTurnMode turn_mode);
 
 /**
  * @brief Stop the peer, release its resources, and set the caller's handle null.

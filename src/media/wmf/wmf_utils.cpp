@@ -235,4 +235,49 @@ bool HasNalu(const uint8_t* data, size_t size, uint8_t type) {
     if (nalu.type == type) return true;
   return false;
 }
+
+std::vector<Nalu> AnnexBHevcNalus(const uint8_t* data, size_t size) {
+  std::vector<Nalu> result;
+  if (!data) return result;
+  size_t payload = size;
+  for (size_t i = 0; i + 2 < size;) {
+    size_t prefix = 0;
+    if (data[i] == 0 && data[i + 1] == 0) {
+      if (data[i + 2] == 1)
+        prefix = 3;
+      else if (i + 3 < size && data[i + 2] == 0 && data[i + 3] == 1)
+        prefix = 4;
+    }
+    if (!prefix) {
+      ++i;
+      continue;
+    }
+    if (payload + 1 < i) {
+      result.push_back(
+          {payload, i - payload,
+           static_cast<uint8_t>((data[payload] >> 1) & 0x3Fu)});
+    }
+    payload = i + prefix;
+    i = payload;
+  }
+  if (payload + 1 < size) {
+    result.push_back(
+        {payload, size - payload,
+         static_cast<uint8_t>((data[payload] >> 1) & 0x3Fu)});
+  }
+  return result;
+}
+
+bool HasHevcNalu(const uint8_t* data, size_t size, uint8_t type) {
+  for (const auto& nalu : AnnexBHevcNalus(data, size))
+    if (nalu.type == type) return true;
+  return false;
+}
+
+bool IsHevcKeyFrame(const uint8_t* data, size_t size) {
+  for (const auto& nalu : AnnexBHevcNalus(data, size)) {
+    if (nalu.type == 19 || nalu.type == 20 || nalu.type == 21) return true;
+  }
+  return false;
+}
 }  // namespace minirtc::wmf

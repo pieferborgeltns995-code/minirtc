@@ -113,13 +113,14 @@ void VideoChannelSend::Initialize(rtp::PAYLOAD_TYPE payload_type,
 void VideoChannelSend::Initialize(rtp::PAYLOAD_TYPE payload_type,
                                   std::shared_ptr<PacedSender> packet_sender,
                                   bool rtx_enabled) {
+  media_payload_type_ = payload_type;
   rtx_enabled_ = rtx_enabled;
   paced_sender_ = packet_sender;
   if (fec_state_) fec_state_->active.store(false);
   fec_state_ = std::make_shared<FecSendState>();
   fec_state_->pacer = packet_sender;
-  fec_state_->clock = clock_;
   fec_state_->channel = channel_name_;
+  fec_state_->clock = clock_;
   fec_state_->rtx_ssrc = rtx_ssrc_;
   rtp_packetizer_ = RtpPacketizer::Create(payload_type, ssrc_);
   if (fec_enabled_ && rtx_enabled_) rtp_packetizer_->SetMaxPayloadSize(1100);
@@ -181,7 +182,9 @@ void VideoChannelSend::OnSentRtpPacket(
     if (packet->retransmitted_sequence_number()) {
       rtp_packet_history_.MarkPacketAsSent(
           packet->retransmitted_sequence_number().value());
-    } else if (packet->PayloadType() != rtp::PAYLOAD_TYPE::H264 - 1) {
+    } else if (static_cast<uint8_t>(packet->PayloadType()) !=
+                   static_cast<uint8_t>(media_payload_type_) - 1u &&
+               packet->packet_type() != webrtc::RtpPacketMediaType::kPadding) {
       rtp_packet_history_.PutRtpPacket(std::move(packet),
                                        clock_->CurrentTime());
     }

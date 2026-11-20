@@ -3196,8 +3196,14 @@ int IceTransportController::CreateCodecs(std::shared_ptr<SystemClock> clock,
 #else
     ret = CreateStreamCodecs(clock, false, VideoCodecType::H264);
 #endif
+  } else if (rtp::PAYLOAD_TYPE::HEVC == video_pt) {
+#if defined(_WIN32) || (defined(__APPLE__) && !defined(MINIRTC_IOS))
+    ret = CreateStreamCodecs(clock, hardware_acceleration_,
+                             VideoCodecType::HEVC);
+#else
+    LOG_ERROR("HEVC video codec is not supported on this platform");
+#endif
   }
-
   if (ret == 0) {
     video_codec_inited_ = true;
   }
