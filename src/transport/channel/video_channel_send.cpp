@@ -181,7 +181,9 @@ void VideoChannelSend::OnSentRtpPacket(
     if (packet->retransmitted_sequence_number()) {
       rtp_packet_history_.MarkPacketAsSent(
           packet->retransmitted_sequence_number().value());
-    } else if (packet->PayloadType() != rtp::PAYLOAD_TYPE::H264 - 1) {
+    } else if (packet->packet_type() != webrtc::RtpPacketMediaType::kPadding &&
+               packet->PayloadType() != rtp::PAYLOAD_TYPE::H264 - 1 &&
+               packet->PayloadType() != rtp::PAYLOAD_TYPE::AV1 - 1) {
       rtp_packet_history_.PutRtpPacket(std::move(packet),
                                        clock_->CurrentTime());
     }

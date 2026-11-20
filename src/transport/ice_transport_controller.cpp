@@ -167,7 +167,6 @@ void IceTransportController::Create(bool offer_peer, std::string remote_user_id,
 
   task_queue_cc_ = std::make_shared<TaskQueue>("congest control");
   task_queue_pacer_ = std::make_shared<TaskQueue>("pacer");
-  pending_encode_frame_tasks_ = std::make_shared<std::atomic<uint32_t>>(0);
   task_queue_encode_ = std::make_shared<TaskQueueLockFree>("encode");
   task_queue_decode_ = std::make_shared<TaskQueueLockFree>("decode");
   task_queue_trans_fb_ =
@@ -783,18 +782,6 @@ int IceTransportController::SendVideo(const MiniRtcVideoFrame* video_frame,
       return 0;
     }
 
-    // Reject coalesced frames before copying the full desktop buffer. At 4K,
-    // copying frames that are known to be dropped can consume hundreds of MB/s
-    // and slow the capture callback itself below its configured frame rate.
-    // Track only queued video frame tasks so control tasks (e.g. BWE bitrate
-    // updates) on the same queue do not trigger false frame drops.
-    if (pending_encode_frame_tasks_ &&
-        pending_encode_frame_tasks_->load(std::memory_order_acquire) > 0) {
-      context->encode_queue_dropped_frame_total.fetch_add(
-          1, std::memory_order_relaxed);
-      return 0;
-    }
-
     RawFrame raw_frame = native_frame
                              ? RawFrame(*native_frame)
                              : RawFrame(
@@ -909,43 +896,57 @@ int IceTransportController::SendVideo(const MiniRtcVideoFrame* video_frame,
         context->target_height.value_or(source_height));
     const int target_width = target_resolution.first;
     const int target_height = target_resolution.second;
-    struct PendingEncodeTaskGuard {
-      std::shared_ptr<std::atomic<uint32_t>> counter;
-      bool armed = false;
-      explicit PendingEncodeTaskGuard(std::shared_ptr<std::atomic<uint32_t>> c)
-          : counter(std::move(c)) {
-        if (counter) {
-          counter->fetch_add(1, std::memory_order_acq_rel);
-          armed = true;
+
+    // Keep only one unstarted waiting frame per stream and overwrite it when
+    // newer captures arrive during an encoder stall, avoiding stale backlog
+    // and multi-frame gaps once encoding resumes.
+    std::optional<RawFrame> superseded_frame;
+    bool should_post_encode_task = false;
+    {
+      std::lock_guard<std::mutex> lock(context->pending_encode_mutex_);
+      if (context->pending_encode_frame.has_value()) {
+        force_i_frame =
+            force_i_frame || context->pending_encode_frame->force_i_frame;
+        superseded_frame.emplace(
+            std::move(context->pending_encode_frame->frame));
+        context->pending_encode_frame.reset();
+        context->encode_queue_dropped_frame_total.fetch_add(
+            1, std::memory_order_relaxed);
+      }
+      context->pending_encode_frame.emplace(StreamContext::PendingEncodeFrame{
+          std::move(raw_frame), force_i_frame, target_width, target_height,
+          settings_generation});
+      if (!context->encode_task_queued) {
+        context->encode_task_queued = true;
+        should_post_encode_task = true;
+      }
+    }
+    if (!should_post_encode_task) {
+      return 0;
+    }
+
+    encode_queue->PostTask([weak_self, weak_context, encode_queue,
+                            channel_name]() mutable {
+      std::optional<StreamContext::PendingEncodeFrame> pending;
+      if (auto locked_context = weak_context.lock()) {
+        std::lock_guard<std::mutex> lock(locked_context->pending_encode_mutex_);
+        if (locked_context->pending_encode_frame.has_value()) {
+          pending.emplace(std::move(*locked_context->pending_encode_frame));
+          locked_context->pending_encode_frame.reset();
         }
+        locked_context->encode_task_queued = false;
       }
-      PendingEncodeTaskGuard(PendingEncodeTaskGuard&& other) noexcept
-          : counter(std::move(other.counter)), armed(other.armed) {
-        other.armed = false;
-      }
-      PendingEncodeTaskGuard& operator=(PendingEncodeTaskGuard&&) = delete;
-      PendingEncodeTaskGuard(const PendingEncodeTaskGuard&) = delete;
-      PendingEncodeTaskGuard& operator=(const PendingEncodeTaskGuard&) = delete;
-      void Release() {
-        if (armed && counter) {
-          counter->fetch_sub(1, std::memory_order_acq_rel);
-          armed = false;
-        }
-      }
-      ~PendingEncodeTaskGuard() { Release(); }
-    };
-    PendingEncodeTaskGuard pending_guard(pending_encode_frame_tasks_);
-    encode_queue->PostTask([weak_self, weak_context, encode_queue, channel_name,
-                            force_i_frame, target_width, target_height,
-                            settings_generation,
-                            pending_guard = std::move(pending_guard),
-                            frame = std::move(raw_frame)]() mutable {
-      pending_guard.Release();
       auto self = weak_self.lock();
       auto context = weak_context.lock();
-      if (!self || !context || !self->is_running_.load()) {
+      if (!self || !context || !self->is_running_.load() ||
+          !pending.has_value()) {
         return;
       }
+      RawFrame frame = std::move(pending->frame);
+      bool force_i_frame = pending->force_i_frame;
+      const int target_width = pending->target_width;
+      const int target_height = pending->target_height;
+      const uint64_t settings_generation = pending->settings_generation;
 
       {
         std::shared_lock lock(self->stream_senders_mutex_);

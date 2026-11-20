@@ -27,6 +27,7 @@ RtpPacketizerAv1::~RtpPacketizerAv1() {}
 std::vector<std::unique_ptr<RtpPacket>> RtpPacketizerAv1::Build(
     uint8_t* payload, uint32_t payload_size, uint32_t rtp_timestamp,
     bool use_rtp_packet_to_send) {
+  std::lock_guard<std::mutex> lock(packetizer_mutex_);
   std::vector<std::unique_ptr<RtpPacket>> rtp_packets;
   std::vector<Obu> obus = ParseObus(payload, payload_size);
   has_extension_ = HasAbsoluteSendTimeExtension();
@@ -127,6 +128,21 @@ std::vector<std::unique_ptr<RtpPacket>> RtpPacketizerAv1::Build(
   }
 
   return rtp_packets;
+}
+
+std::vector<std::unique_ptr<RtpPacket>> RtpPacketizerAv1::BuildPadding(
+    uint32_t payload_size, uint32_t rtp_timestamp,
+    bool use_rtp_packet_to_send) {
+  std::lock_guard<std::mutex> lock(packetizer_mutex_);
+  has_padding_ = true;
+  has_extension_ = HasAbsoluteSendTimeExtension();
+  csrc_count_ = 0;
+  marker_ = 0;
+  timestamp_ = rtp_timestamp;
+  return BuildPaddingPackets(
+      payload_size, rtp_timestamp, static_cast<uint8_t>(payload_type_ - 1),
+      ssrc_, sequence_number_, csrcs_, csrc_count_, use_rtp_packet_to_send,
+      rtp_packet_frame_);
 }
 
 }  // namespace minirtc

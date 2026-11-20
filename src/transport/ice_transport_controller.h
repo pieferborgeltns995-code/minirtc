@@ -350,6 +350,18 @@ class IceTransportController
     int last_network_loss_pct = 0;
     bool last_network_in_alr = false;
 
+    struct PendingEncodeFrame {
+      RawFrame frame;
+      bool force_i_frame = false;
+      int target_width = 0;
+      int target_height = 0;
+      uint64_t settings_generation = 0;
+    };
+    // Leaf lock: never acquire stream_senders_mutex_ while holding this mutex.
+    std::mutex pending_encode_mutex_;
+    bool encode_task_queued = false;
+    std::optional<PendingEncodeFrame> pending_encode_frame;
+
     void FinishStartupKeyframe() {
       startup_keyframe_pending = false;
       keyframe_size_budget_bytes = regular_keyframe_size_budget_bytes;
@@ -535,7 +547,6 @@ class IceTransportController
   std::shared_ptr<TaskQueue> task_queue_cc_;
   std::shared_ptr<TaskQueue> task_queue_pacer_;
   std::shared_ptr<TaskQueueLockFree> task_queue_encode_;
-  std::shared_ptr<std::atomic<uint32_t>> pending_encode_frame_tasks_;
   std::shared_ptr<TaskQueueLockFree> task_queue_decode_;
   std::shared_ptr<TaskQueueLockFree> task_queue_trans_fb_;
   webrtc::DataSize congestion_window_size_;

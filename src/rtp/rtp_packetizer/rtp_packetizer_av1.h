@@ -7,6 +7,8 @@
 #ifndef _RTP_PACKETIZER_AV1_H_
 #define _RTP_PACKETIZER_AV1_H_
 
+#include <mutex>
+
 #include "rtp_packetizer.h"
 
 namespace minirtc {
@@ -23,9 +25,7 @@ class RtpPacketizerAv1 : public RtpPacketizer {
 
   std::vector<std::unique_ptr<RtpPacket>> BuildPadding(
       uint32_t payload_size, uint32_t rtp_timestamp,
-      bool use_rtp_packet_to_send) override {
-    return std::vector<std::unique_ptr<RtpPacket>>{};
-  };
+      bool use_rtp_packet_to_send) override;
 
   void SetIsKeyFrame(bool is_key_frame) override {
     current_frame_is_key_frame_ = is_key_frame;
@@ -41,6 +41,7 @@ class RtpPacketizerAv1 : public RtpPacketizer {
   }
 
  private:
+  std::mutex packetizer_mutex_;
   uint8_t version_;
   bool has_padding_;
   bool has_extension_;

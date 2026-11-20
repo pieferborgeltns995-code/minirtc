@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <vector>
 
 #include "rtp_packet.h"
 #include "rtp_packet_to_send.h"
@@ -52,6 +53,11 @@ class RtpPacketizer {
   }
   void AppendAbsoluteSendTimeExtension(
       std::vector<uint8_t>& rtp_packet_frame) const;
+  std::vector<std::unique_ptr<RtpPacket>> BuildPaddingPackets(
+      uint32_t payload_size, uint32_t rtp_timestamp,
+      uint8_t padding_payload_type, uint32_t ssrc, uint16_t& sequence_number,
+      const std::vector<uint32_t>& csrcs, uint32_t csrc_count,
+      bool use_rtp_packet_to_send, std::vector<uint8_t>& rtp_packet_frame) const;
 
  private:
   std::optional<uint8_t> abs_send_time_ext_id_;
