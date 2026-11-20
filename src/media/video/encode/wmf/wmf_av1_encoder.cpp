@@ -15,14 +15,22 @@
 #include <thread>
 #include <vector>
 
+#include "av1_encode_helpers.h"
 #include "avt/svt_av1_encoder.h"
 #include "log.h"
-#include "nv12_scaler.h"
-#include "video/av1_crop_metadata.h"
 #include "wmf/wmf_utils.h"
 
 namespace minirtc {
 namespace {
+using av1_encode::BuildCandidateEncodeSizes;
+using av1_encode::CacheSequenceHeaderFromBytes;
+using av1_encode::EncodeMode;
+using av1_encode::EncodeStatsTracker;
+using av1_encode::PrepareNv12ToStridedPlanes;
+using av1_encode::ProcessEncodedAv1Bitstream;
+using av1_encode::PushEncodedAv1Frame;
+using av1_encode::ResolveCpuNv12;
+using av1_encode::ValidConfig;
 using wmf::ComPtr;
 
 // MFVideoFormat_AV1 ('AV01') defined explicitly for broad Windows SDK compat.
@@ -31,11 +39,6 @@ constexpr GUID kVideoFormatAv1 = {
     0x0000,
     0x0010,
     {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}};
-
-constexpr uint8_t kObuTypeSequenceHeader = 1;
-constexpr uint8_t kObuTypeTemporalDelimiter = 2;
-constexpr uint8_t kObuTypeFrameHeader = 3;
-constexpr uint8_t kObuTypeFrame = 6;
 
 HRESULT SetUint(ICodecAPI* api, const GUID& key, ULONG value) {
   VARIANT variant{};
@@ -64,167 +67,6 @@ HRESULT EnumerateEncoders(IMFActivate*** activates, UINT32* count) {
   return MFTEnumEx(MFT_CATEGORY_VIDEO_ENCODER,
                    MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
                    nullptr, &output, activates, count);
-}
-
-bool ValidConfig(const MediaCodecConfig& config) {
-  size_t size = 0;
-  return config.init_width > 0 && config.init_height > 0 &&
-         config.init_width <= 8192 && config.init_height <= 8192 &&
-         GetNv12FrameSize(config.init_width, config.init_height, &size) &&
-         config.init_bitrate > 0 && config.max_bitrate > 0 &&
-         config.max_frame_rate > 0 && config.max_frame_rate <= 240 &&
-         config.key_frame_interval > 0;
-}
-
-enum class EncodeMode {
-  kNative = 0,
-  kPad = 1,
-  kScale = 2,
-};
-
-struct EncodeSize {
-  int width = 0;
-  int height = 0;
-  EncodeMode mode = EncodeMode::kNative;
-};
-
-int AlignDimDown(int value, int align, int min_value) {
-  if (value <= min_value) return min_value;
-  return (value / align) * align;
-}
-
-int AlignDimUp(int value, int align) {
-  if (value <= 0) return align;
-  return ((value + align - 1) / align) * align;
-}
-
-std::vector<EncodeSize> BuildCandidateEncodeSizes(int src_w, int src_h) {
-  std::vector<EncodeSize> candidates;
-  auto push_unique = [&](int w, int h, EncodeMode mode) {
-    if (w <= 0 || h <= 0 || w > 8192 || h > 8192 ||
-        (w & 1) != 0 || (h & 1) != 0) {
-      return;
-    }
-    for (const auto& c : candidates) {
-      if (c.width == w && c.height == h) return;
-    }
-    candidates.push_back({w, h, mode});
-  };
-  push_unique(src_w, src_h, EncodeMode::kNative);
-  // Prefer 1:1 edge-clamped padding to 64x16 alignment over scaling so desktop
-  // text keeps native sharpness without bilinear resampling.
-  push_unique(AlignDimUp(src_w, 64), AlignDimUp(src_h, 16), EncodeMode::kPad);
-  // Fallback to downscaling if padded size exceeds hardware limits.
-  push_unique(AlignDimDown(src_w, 64, 64), AlignDimDown(src_h, 16, 16),
-              EncodeMode::kScale);
-  if (src_w > 3840 || src_h > 2160) {
-    const double scale = std::min(3840.0 / static_cast<double>(src_w),
-                                  2160.0 / static_cast<double>(src_h));
-    push_unique(AlignDimDown(static_cast<int>(src_w * scale), 64, 64),
-                AlignDimDown(static_cast<int>(src_h * scale), 16, 16),
-                EncodeMode::kScale);
-  }
-  return candidates;
-}
-
-bool PadNv12EdgeClamp(const uint8_t* src, int src_w, int src_h, uint8_t* dst,
-                      int dst_w, int dst_h) {
-  if (!src || !dst || src_w <= 0 || src_h <= 0 || dst_w < src_w ||
-      dst_h < src_h || (src_w & 1) != 0 || (src_h & 1) != 0 ||
-      (dst_w & 1) != 0 || (dst_h & 1) != 0) {
-    return false;
-  }
-  const int pad_right = dst_w - src_w;
-  for (int y = 0; y < src_h; ++y) {
-    const uint8_t* src_row = src + static_cast<size_t>(y) * src_w;
-    uint8_t* dst_row = dst + static_cast<size_t>(y) * dst_w;
-    std::memcpy(dst_row, src_row, static_cast<size_t>(src_w));
-    if (pad_right > 0) {
-      std::memset(dst_row + src_w, src_row[src_w - 1],
-                  static_cast<size_t>(pad_right));
-    }
-  }
-  const uint8_t* last_y = dst + static_cast<size_t>(src_h - 1) * dst_w;
-  for (int y = src_h; y < dst_h; ++y) {
-    std::memcpy(dst + static_cast<size_t>(y) * dst_w, last_y,
-                static_cast<size_t>(dst_w));
-  }
-
-  const uint8_t* src_uv = src + static_cast<size_t>(src_w) * src_h;
-  uint8_t* dst_uv = dst + static_cast<size_t>(dst_w) * dst_h;
-  const int src_uv_h = src_h / 2;
-  const int dst_uv_h = dst_h / 2;
-  for (int y = 0; y < src_uv_h; ++y) {
-    const uint8_t* src_row = src_uv + static_cast<size_t>(y) * src_w;
-    uint8_t* dst_row = dst_uv + static_cast<size_t>(y) * dst_w;
-    std::memcpy(dst_row, src_row, static_cast<size_t>(src_w));
-    const uint8_t u = src_row[src_w - 2];
-    const uint8_t v = src_row[src_w - 1];
-    for (int x = src_w; x < dst_w; x += 2) {
-      dst_row[x] = u;
-      dst_row[x + 1] = v;
-    }
-  }
-  const uint8_t* last_uv = dst_uv + static_cast<size_t>(src_uv_h - 1) * dst_w;
-  for (int y = src_uv_h; y < dst_uv_h; ++y) {
-    std::memcpy(dst_uv + static_cast<size_t>(y) * dst_w, last_uv,
-                static_cast<size_t>(dst_w));
-  }
-  return true;
-}
-
-struct Av1ObuSpan {
-  size_t offset = 0;
-  size_t size = 0;
-  size_t payload_offset = 0;
-  size_t payload_size = 0;
-  uint8_t type = 0;
-};
-
-bool ReadLeb128(const uint8_t* data, size_t size, size_t& pos,
-                uint64_t& value) {
-  value = 0;
-  for (int i = 0; i < 8; ++i) {
-    if (pos >= size) return false;
-    const uint8_t byte = data[pos++];
-    value |= static_cast<uint64_t>(byte & 0x7F) << (i * 7);
-    if ((byte & 0x80) == 0) return true;
-  }
-  return false;
-}
-
-std::vector<Av1ObuSpan> ParseAv1Obus(const uint8_t* data, size_t size) {
-  std::vector<Av1ObuSpan> obus;
-  size_t pos = 0;
-  while (pos < size) {
-    const size_t start = pos;
-    const uint8_t header = data[pos++];
-    if ((header & 0x80) != 0) {
-      // obu_forbidden_bit must be 0 in a valid raw OBU stream.
-      return {};
-    }
-    const uint8_t type = (header >> 3) & 0x0F;
-    const bool has_extension = (header & 0x04) != 0;
-    const bool has_size = (header & 0x02) != 0;
-    if (has_extension) {
-      if (pos >= size) return {};
-      ++pos;
-    }
-    uint64_t payload_size = 0;
-    if (has_size) {
-      if (!ReadLeb128(data, size, pos, payload_size) ||
-          payload_size > size - pos) {
-        return {};
-      }
-    } else {
-      payload_size = size - pos;
-    }
-    const size_t payload_offset = pos;
-    pos += static_cast<size_t>(payload_size);
-    obus.push_back(Av1ObuSpan{start, pos - start, payload_offset,
-                              static_cast<size_t>(payload_size), type});
-  }
-  return obus;
 }
 
 }  // namespace
@@ -502,16 +344,6 @@ class WmfAv1Encoder::Impl {
     return encoder_ ? S_OK : hr;
   }
 
-  void CacheSequenceHeaderFromBytes(const uint8_t* data, size_t size) {
-    for (const auto& obu : ParseAv1Obus(data, size)) {
-      if (obu.type == kObuTypeSequenceHeader) {
-        sequence_header_.assign(data + obu.offset,
-                                data + obu.offset + obu.size);
-        return;
-      }
-    }
-  }
-
   HRESULT ReadFrame(IMFSample* sample, const RawFrame& raw,
                     std::vector<EncodedFrame>& frames) {
     output_bytes_.clear();
@@ -520,83 +352,36 @@ class WmfAv1Encoder::Impl {
     auto& bytes = output_bytes_;
     if (bytes.empty()) return MF_E_INVALID_STREAM_DATA;
 
-    const auto obus = ParseAv1Obus(bytes.data(), bytes.size());
-    if (obus.empty()) {
-      LOG_WARN("WMF AV1 output is not a valid OBU stream (size={})",
-               bytes.size());
-      return MF_E_INVALID_STREAM_DATA;
-    }
-
-    bool has_seq_header = false;
-    bool obu_is_key = false;
-    size_t insert_offset = 0;
-    size_t after_seq_offset = 0;
-    for (const auto& obu : obus) {
-      if (obu.type == kObuTypeTemporalDelimiter && obu.offset == 0) {
-        insert_offset = obu.offset + obu.size;
-        after_seq_offset = insert_offset;
-      } else if (obu.type == kObuTypeSequenceHeader) {
-        has_seq_header = true;
-        after_seq_offset = obu.offset + obu.size;
-        sequence_header_.assign(bytes.data() + obu.offset,
-                                bytes.data() + obu.offset + obu.size);
-      } else if ((obu.type == kObuTypeFrameHeader ||
-                  obu.type == kObuTypeFrame) &&
-                 obu.payload_size > 0) {
-        // In AV1 uncompressed_header (non-reduced_still_picture_header):
-        // bit 7 = show_existing_frame (0), bits 6..5 = frame_type (00 = KEY).
-        const uint8_t first = bytes[obu.payload_offset];
-        if ((first & 0xE0) == 0x00) {
-          obu_is_key = true;
-        }
-      }
-    }
-
     UINT32 clean_point = 0;
     const bool sample_clean =
         SUCCEEDED(sample->GetUINT32(MFSampleExtension_CleanPoint,
                                     &clean_point)) &&
         clean_point != 0;
-    const bool key = sample_clean || has_seq_header || obu_is_key;
-
-    if (key && !has_seq_header) {
-      if (sequence_header_.empty()) {
-        ComPtr<IMFMediaType> type;
-        UINT32 size = 0;
-        if (SUCCEEDED(encoder_->GetOutputCurrentType(output_id_, &type)) &&
-            SUCCEEDED(type->GetBlobSize(MF_MT_MPEG_SEQUENCE_HEADER, &size)) &&
-            size > 0) {
-          std::vector<uint8_t> blob(size);
-          if (SUCCEEDED(type->GetBlob(MF_MT_MPEG_SEQUENCE_HEADER, blob.data(),
-                                      size, nullptr))) {
-            CacheSequenceHeaderFromBytes(blob.data(), blob.size());
+    const auto processed = ProcessEncodedAv1Bitstream(
+        bytes, sequence_header_, sample_clean, encode_mode_, source_width_,
+        source_height_,
+        [this](std::vector<uint8_t>& out_seq_hdr) {
+          ComPtr<IMFMediaType> type;
+          UINT32 size = 0;
+          if (SUCCEEDED(encoder_->GetOutputCurrentType(output_id_, &type)) &&
+              SUCCEEDED(type->GetBlobSize(MF_MT_MPEG_SEQUENCE_HEADER, &size)) &&
+              size > 0) {
+            std::vector<uint8_t> blob(size);
+            if (SUCCEEDED(type->GetBlob(MF_MT_MPEG_SEQUENCE_HEADER, blob.data(),
+                                        size, nullptr))) {
+              CacheSequenceHeaderFromBytes(blob.data(), blob.size(),
+                                           out_seq_hdr);
+            }
           }
-        }
-      }
-      if (!sequence_header_.empty()) {
-        bytes.insert(bytes.begin() + static_cast<ptrdiff_t>(insert_offset),
-                     sequence_header_.begin(), sequence_header_.end());
-        after_seq_offset = insert_offset + sequence_header_.size();
-      }
-    }
-    if (key && encode_mode_ == EncodeMode::kPad && source_width_ > 0 &&
-        source_height_ > 0 && source_width_ <= 65535 &&
-        source_height_ <= 65535) {
-      av1_crop::AppendCropMetadataObu(bytes, after_seq_offset,
-                                      static_cast<uint16_t>(source_width_),
-                                      static_cast<uint16_t>(source_height_));
-    }
+        },
+        "WMF AV1");
+    if (!processed.valid) return MF_E_INVALID_STREAM_DATA;
 
     const uint32_t out_w = static_cast<uint32_t>(VisibleWidth());
     const uint32_t out_h = static_cast<uint32_t>(VisibleHeight());
-    EncodedFrame frame(bytes.data(), bytes.size(), out_w, out_h);
-    frame.SetEncodedWidth(out_w);
-    frame.SetEncodedHeight(out_h);
-    frame.SetFrameType(key ? kVideoFrameKey : kVideoFrameDelta);
-    frame.SetCapturedTimestamp(raw.CapturedTimestamp());
-    frame.SetEncodedTimestamp(clock_->CurrentTime());
-    frames.push_back(std::move(frame));
-    if (key) {
+    PushEncodedAv1Frame(bytes, out_w, out_h, processed.is_keyframe,
+                        raw.CapturedTimestamp(), clock_->CurrentTime(), frames);
+    if (processed.is_keyframe) {
       force_idr_ = false;
     }
     return S_OK;
@@ -607,31 +392,6 @@ class WmfAv1Encoder::Impl {
   }
   int VisibleHeight() const {
     return encode_mode_ == EncodeMode::kScale ? encode_height_ : source_height_;
-  }
-
-  const uint8_t* ResolveCpuNv12(const RawFrame& raw) {
-    if (raw.Buffer()) return raw.Buffer();
-    const MiniRtcNativeVideoFrame* native = raw.NativeFrame();
-    if (!native) return nullptr;
-    if (native->type == MiniRtcNativeVideoFrameCpuNv12) {
-      const auto& cpu = native->payload.cpu_nv12;
-      if (cpu.y_plane && cpu.uv_plane && cpu.y_stride == raw.Width() &&
-          cpu.uv_stride == raw.Width() &&
-          cpu.uv_plane ==
-              cpu.y_plane + static_cast<size_t>(raw.Width()) * raw.Height()) {
-        return cpu.y_plane;
-      }
-    }
-    size_t raw_size = 0;
-    if (!GetNv12FrameSize(raw.Width(), raw.Height(), &raw_size)) {
-      return nullptr;
-    }
-    cpu_materialize_buf_.resize(raw_size);
-    if (native->copy_to_nv12(native->owner, cpu_materialize_buf_.data(),
-                             raw_size) != 0) {
-      return nullptr;
-    }
-    return cpu_materialize_buf_.data();
   }
 
   HRESULT EncodeHardware(const RawFrame& raw,
@@ -724,7 +484,7 @@ class WmfAv1Encoder::Impl {
       hr = PrepareInputSample(dxgi_buffer.Get(), next_time_, duration, input);
       if (FAILED(hr)) return hr;
     } else {
-      const uint8_t* src_nv12 = ResolveCpuNv12(raw);
+      const uint8_t* src_nv12 = ResolveCpuNv12(raw, cpu_materialize_buf_);
       if (!src_nv12) return E_INVALIDARG;
       size_t input_size = 0;
       if (!GetNv12FrameSize(encode_width_, encode_height_, &input_size)) {
@@ -740,26 +500,13 @@ class WmfAv1Encoder::Impl {
       BYTE* dst = nullptr;
       hr = reusable_cpu_buffer_->Lock(&dst, nullptr, nullptr);
       if (FAILED(hr)) return hr;
-      bool prepared = true;
-      if (encode_mode_ == EncodeMode::kPad) {
-        prepared = PadNv12EdgeClamp(src_nv12, source_width_, source_height_,
-                                    dst, encode_width_, encode_height_);
-      } else if (encode_mode_ == EncodeMode::kScale) {
-        const uint8_t* src_y = src_nv12;
-        const uint8_t* src_uv =
-            src_y + static_cast<size_t>(source_width_) * source_height_;
-        uint8_t* dst_y = dst;
-        uint8_t* dst_uv =
-            dst_y + static_cast<size_t>(encode_width_) * encode_height_;
-        prepared =
-            ScaleNv12ViaI420(src_y, source_width_, src_uv, source_width_,
-                             source_width_, source_height_, dst_y,
-                             encode_width_, dst_uv, encode_width_,
-                             encode_width_, encode_height_,
-                             libyuv::kFilterBilinear, &scaler_scratch_) == 0;
-      } else {
-        std::memcpy(dst, src_nv12, input_size);
-      }
+      uint8_t* dst_y = dst;
+      uint8_t* dst_uv =
+          dst_y + static_cast<size_t>(encode_width_) * encode_height_;
+      const bool prepared = PrepareNv12ToStridedPlanes(
+          src_nv12, source_width_, source_height_, dst_y, encode_width_,
+          dst_uv, encode_width_, encode_width_, encode_height_, encode_mode_,
+          &scaler_scratch_);
       reusable_cpu_buffer_->Unlock();
       if (!prepared) return E_FAIL;
       hr = reusable_cpu_buffer_->SetCurrentLength(
@@ -874,8 +621,9 @@ class WmfAv1Encoder::Impl {
           const bool is_key =
               !frames.empty() &&
               frames.back().FrameType() == VideoFrameType::kVideoFrameKey;
-          RecordEncodeStats(encode_end, total_ms, wait_need_input_ms,
-                            process_input_ms, hw_ms, encoded_bytes, is_key);
+          stats_.Record("WMF AV1", encode_end, encode_width_, encode_height_,
+                        using_d3d11_, total_ms, wait_need_input_ms,
+                        process_input_ms, hw_ms, encoded_bytes, is_key);
           return S_OK;
         }
       }
@@ -884,61 +632,6 @@ class WmfAv1Encoder::Impl {
       }
     }
     return HRESULT_FROM_WIN32(WAIT_TIMEOUT);
-  }
-
-  static double Percentile(std::vector<double>& samples, double pct) {
-    if (samples.empty()) return 0.0;
-    const size_t idx = std::min(
-        samples.size() - 1,
-        static_cast<size_t>(pct * static_cast<double>(samples.size() - 1)));
-    std::nth_element(samples.begin(), samples.begin() + idx, samples.end());
-    return samples[idx];
-  }
-
-  void RecordEncodeStats(std::chrono::steady_clock::time_point now,
-                         double total_ms, double wait_ms, double input_ms,
-                         double hw_ms, size_t bytes, bool keyframe) {
-    if (stat_window_start_.time_since_epoch().count() == 0) {
-      stat_window_start_ = now;
-    }
-    stat_total_ms_.push_back(total_ms);
-    stat_wait_ms_.push_back(wait_ms);
-    stat_input_ms_.push_back(input_ms);
-    stat_hw_ms_.push_back(hw_ms);
-    stat_total_bytes_ += bytes;
-    if (keyframe) ++stat_keyframes_;
-    const double elapsed_s =
-        std::chrono::duration<double>(now - stat_window_start_).count();
-    if (elapsed_s < 5.0 || stat_total_ms_.empty()) return;
-
-    const size_t n = stat_total_ms_.size();
-    const double enc_p50 = Percentile(stat_total_ms_, 0.50);
-    const double enc_p95 = Percentile(stat_total_ms_, 0.95);
-    const double enc_max =
-        *std::max_element(stat_total_ms_.begin(), stat_total_ms_.end());
-    const double wait_p50 = Percentile(stat_wait_ms_, 0.50);
-    const double wait_p95 = Percentile(stat_wait_ms_, 0.95);
-    const double in_p50 = Percentile(stat_input_ms_, 0.50);
-    const double in_p95 = Percentile(stat_input_ms_, 0.95);
-    const double hw_p50 = Percentile(stat_hw_ms_, 0.50);
-    const double hw_p95 = Percentile(stat_hw_ms_, 0.95);
-    const double avg_kb =
-        static_cast<double>(stat_total_bytes_) / (static_cast<double>(n) * 1024.0);
-    LOG_INFO(
-        "WMF AV1 stats ({:.1f}s): {}x{} d3d11={} frames={} fps={:.1f} kf={} "
-        "enc_ms[p50={:.2f} p95={:.2f} max={:.2f}] "
-        "wait_ms[p50={:.2f} p95={:.2f}] input_ms[p50={:.2f} p95={:.2f}] "
-        "hw_ms[p50={:.2f} p95={:.2f}] avg_kb={:.1f}",
-        elapsed_s, encode_width_, encode_height_, using_d3d11_, n,
-        static_cast<double>(n) / elapsed_s, stat_keyframes_, enc_p50, enc_p95,
-        enc_max, wait_p50, wait_p95, in_p50, in_p95, hw_p50, hw_p95, avg_kb);
-    stat_window_start_ = now;
-    stat_total_ms_.clear();
-    stat_wait_ms_.clear();
-    stat_input_ms_.clear();
-    stat_hw_ms_.clear();
-    stat_total_bytes_ = 0;
-    stat_keyframes_ = 0;
   }
 
   wmf::CodecThread worker_;
@@ -978,13 +671,7 @@ class WmfAv1Encoder::Impl {
   std::vector<uint8_t> cpu_materialize_buf_;
   std::vector<uint8_t> scaler_scratch_;
   std::unique_ptr<SvtAv1Encoder> fallback_;
-  std::chrono::steady_clock::time_point stat_window_start_;
-  std::vector<double> stat_total_ms_;
-  std::vector<double> stat_wait_ms_;
-  std::vector<double> stat_input_ms_;
-  std::vector<double> stat_hw_ms_;
-  size_t stat_total_bytes_ = 0;
-  uint64_t stat_keyframes_ = 0;
+  EncodeStatsTracker stats_;
 };
 
 WmfAv1Encoder::WmfAv1Encoder(std::shared_ptr<SystemClock> clock)

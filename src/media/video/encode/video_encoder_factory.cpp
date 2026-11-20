@@ -8,6 +8,7 @@
 #endif
 
 #if defined(_WIN32) || defined(_WIN64)
+#include "amf/amf_av1_encoder.h"
 #include "wmf/wmf_av1_encoder.h"
 #include "wmf/wmf_h264_encoder.h"
 #if USE_CUDA
@@ -67,6 +68,10 @@ std::unique_ptr<MediaCodec> VideoEncoderFactory::CreateVideoEncoder(
 #endif
   if (codec_type == VideoCodecType::AV1) {
 #if defined(_WIN32) || defined(_WIN64)
+    if (hardware_acceleration && AmfAv1Encoder::IsSupported()) {
+      LOG_INFO("Using the AMD AMF hardware AV1 encoder");
+      return std::make_unique<AmfAv1Encoder>(clock);
+    }
     if (hardware_acceleration && WmfAv1Encoder::IsSupported()) {
       LOG_INFO("Using the Media Foundation hardware AV1 encoder");
       return std::make_unique<WmfAv1Encoder>(clock);
@@ -128,14 +133,27 @@ std::unique_ptr<MediaCodec> VideoEncoderFactory::CreateInitializedVideoEncoder(
     bool hardware_acceleration, VideoCodecType codec_type) {
 #if defined(_WIN32) || defined(_WIN64)
   if (codec_type == VideoCodecType::AV1) {
-    if (hardware_acceleration && WmfAv1Encoder::IsSupported()) {
-      if (auto encoder = TryInitEncoder(
-              std::make_unique<WmfAv1Encoder>(clock), config)) {
-        return encoder;
+    if (hardware_acceleration) {
+      if (AmfAv1Encoder::IsSupported()) {
+        if (auto encoder = TryInitEncoder(
+                std::make_unique<AmfAv1Encoder>(clock), config)) {
+          LOG_INFO("Using the AMD AMF hardware AV1 encoder");
+          return encoder;
+        }
+        LOG_WARN(
+            "AMD AMF AV1 encoder initialization failed; trying Media "
+            "Foundation AV1");
       }
-      LOG_WARN(
-          "Hardware AV1 encoder initialization failed; falling back to "
-          "SVT-AV1");
+      if (WmfAv1Encoder::IsSupported()) {
+        if (auto encoder = TryInitEncoder(
+                std::make_unique<WmfAv1Encoder>(clock), config)) {
+          LOG_INFO("Using the Media Foundation hardware AV1 encoder");
+          return encoder;
+        }
+        LOG_WARN(
+            "Hardware AV1 encoder initialization failed; falling back to "
+            "SVT-AV1");
+      }
     }
     return TryInitEncoder(std::make_unique<SvtAv1Encoder>(clock), config);
   }
@@ -187,7 +205,7 @@ bool VideoEncoderFactory::CheckIsHardwareAccelerationSupported(
 #else
 #if defined(_WIN32) || defined(_WIN64)
   if (codec_type == VideoCodecType::AV1) {
-    return WmfAv1Encoder::IsSupported();
+    return AmfAv1Encoder::IsSupported() || WmfAv1Encoder::IsSupported();
   }
 #endif
   if (codec_type != VideoCodecType::H264) {

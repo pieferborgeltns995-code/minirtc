@@ -267,6 +267,7 @@ target("media")
     end
     if is_os("windows") then
         add_files("src/media/wmf/*.cpp",
+        "src/media/video/encode/amf/*.cpp",
         "src/media/video/encode/wmf/*.cpp",
         "src/media/video/encode/*.cpp",
         "src/media/video/decode/*.cpp",
@@ -276,6 +277,8 @@ target("media")
         "src/media/video/encode/avt/*.cpp",
         "src/media/video/decode/dav1d/*.cpp")
         add_includedirs("src/media/video/encode",
+        "src/media/video/encode/amf",
+        "thirdparty/amf/include",
         "src/media/video/decode",
         "src/media/video/decode/wmf",
         "src/media/video/encode/openh264",
