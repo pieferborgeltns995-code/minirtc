@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <thread>
@@ -1098,7 +1099,16 @@ int WmfAv1Encoder::SetTargetBitrate(int bitrate) {
       return result;
     }
     if (!impl_->api_) return -1;
-    if (bitrate == impl_->config_.init_bitrate) return 0;
+    const int applied = impl_->config_.init_bitrate;
+    if (bitrate == applied) return 0;
+    const bool at_bound =
+        bitrate == min_supported || bitrate == impl_->config_.max_bitrate;
+    // Ignore minor BWE fluctuations (<10%) unless hitting a hard bound; AMD's
+    // MFT rate controller can stall >100 ms across frequent MeanBitRate resets.
+    if (!at_bound && applied > 0 &&
+        std::llabs(static_cast<int64_t>(bitrate) - applied) * 10 < applied) {
+      return 0;
+    }
     const HRESULT hr =
         SetUint(impl_->api_.Get(), CODECAPI_AVEncCommonMeanBitRate, bitrate);
     if (FAILED(hr)) {
