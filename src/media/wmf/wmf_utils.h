@@ -60,10 +60,46 @@ class CodecThread {
   std::thread thread_;
 };
 
+class CallbackThread {
+ public:
+  CallbackThread();
+  ~CallbackThread();
+  CallbackThread(const CallbackThread&) = delete;
+  CallbackThread& operator=(const CallbackThread&) = delete;
+
+  void Post(std::function<void()> task);
+  void Flush();
+
+ private:
+  std::mutex mutex_;
+  std::condition_variable ready_;
+  std::condition_variable idle_;
+  std::queue<std::function<void()>> tasks_;
+  size_t active_ = 0;
+  bool stopping_ = false;
+  std::thread thread_;
+};
+
+struct ReusableOutputSample {
+  ComPtr<IMFSample> sample;
+  ComPtr<IMFMediaBuffer> buffer;
+  DWORD size = 0;
+  DWORD alignment = 0;
+
+  void Reset() {
+    sample.Reset();
+    buffer.Reset();
+    size = 0;
+    alignment = 0;
+  }
+};
+
 HRESULT CreateSample(const uint8_t* data, size_t size, LONGLONG time,
                      LONGLONG duration, ComPtr<IMFSample>& sample);
 HRESULT ReadOutput(IMFTransform* transform, DWORD stream_id,
                    ComPtr<IMFSample>& sample);
+HRESULT ReadOutput(IMFTransform* transform, DWORD stream_id,
+                   ReusableOutputSample& cache, ComPtr<IMFSample>& sample);
 HRESULT ReadBytes(IMFSample* sample, std::vector<uint8_t>& bytes);
 void ShutdownTransform(ComPtr<IMFTransform>& transform);
 

@@ -52,6 +52,7 @@ class WmfH264Encoder::Impl {
   }
 
   void Reset() {
+    reusable_output_sample_.Reset();
     events_.Reset();
     api_.Reset();
     wmf::ShutdownTransform(encoder_);
@@ -292,8 +293,10 @@ class WmfH264Encoder::Impl {
       }
       if (have_output) {
         ComPtr<IMFSample> output;
-        hr = wmf::ReadOutput(encoder_.Get(), output_id_, output);
+        hr = wmf::ReadOutput(encoder_.Get(), output_id_,
+                             reusable_output_sample_, output);
         if (hr == MF_E_TRANSFORM_STREAM_CHANGE) {
+          reusable_output_sample_.Reset();
           ComPtr<IMFMediaType> type;
           hr = encoder_->GetOutputAvailableType(output_id_, 0, &type);
           if (FAILED(hr)) return hr;
@@ -303,7 +306,8 @@ class WmfH264Encoder::Impl {
           // when it reports a format change. Wait for the next notification;
           // another ProcessOutput here fails with E_UNEXPECTED on Intel MFTs.
           if (async_) continue;
-          hr = wmf::ReadOutput(encoder_.Get(), output_id_, output);
+          hr = wmf::ReadOutput(encoder_.Get(), output_id_,
+                               reusable_output_sample_, output);
         }
         if (FAILED(hr) && hr != MF_E_TRANSFORM_NEED_MORE_INPUT) return hr;
         if (SUCCEEDED(hr) && output) {
@@ -325,6 +329,7 @@ class WmfH264Encoder::Impl {
   ComPtr<IMFTransform> encoder_;
   ComPtr<IMFMediaEventGenerator> events_;
   ComPtr<ICodecAPI> api_;
+  wmf::ReusableOutputSample reusable_output_sample_;
   DWORD input_id_ = 0, output_id_ = 0;
   unsigned input_credit_ = 0;
   bool async_ = false, force_idr_ = true, reconfigure_ = false;

@@ -38,6 +38,54 @@ CodecThread::~CodecThread() {
   thread_.join();
 }
 
+CallbackThread::CallbackThread() {
+  thread_ = std::thread([this] {
+    for (;;) {
+      std::function<void()> task;
+      {
+        std::unique_lock<std::mutex> lock(mutex_);
+        ready_.wait(lock, [this] { return stopping_ || !tasks_.empty(); });
+        if (tasks_.empty() && stopping_) break;
+        task = std::move(tasks_.front());
+        tasks_.pop();
+        ++active_;
+      }
+      task();
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        --active_;
+        if (tasks_.empty() && active_ == 0) {
+          idle_.notify_all();
+        }
+      }
+    }
+  });
+}
+
+CallbackThread::~CallbackThread() {
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    stopping_ = true;
+  }
+  ready_.notify_one();
+  if (thread_.joinable()) thread_.join();
+}
+
+void CallbackThread::Post(std::function<void()> task) {
+  if (!task) return;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (stopping_) return;
+    tasks_.push(std::move(task));
+  }
+  ready_.notify_one();
+}
+
+void CallbackThread::Flush() {
+  std::unique_lock<std::mutex> lock(mutex_);
+  idle_.wait(lock, [this] { return tasks_.empty() && active_ == 0; });
+}
+
 HRESULT CreateSample(const uint8_t* data, size_t size, LONGLONG time,
                      LONGLONG duration, ComPtr<IMFSample>& sample) {
   sample.Reset();
@@ -63,7 +111,7 @@ HRESULT CreateSample(const uint8_t* data, size_t size, LONGLONG time,
 }
 
 HRESULT ReadOutput(IMFTransform* transform, DWORD stream_id,
-                   ComPtr<IMFSample>& sample) {
+                   ReusableOutputSample& cache, ComPtr<IMFSample>& sample) {
   sample.Reset();
   MFT_OUTPUT_STREAM_INFO info{};
   HRESULT hr = transform->GetOutputStreamInfo(stream_id, &info);
@@ -71,14 +119,38 @@ HRESULT ReadOutput(IMFTransform* transform, DWORD stream_id,
   ComPtr<IMFSample> supplied;
   if (!(info.dwFlags & (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES |
                         MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES))) {
-    ComPtr<IMFMediaBuffer> buffer;
-    hr = MFCreateSample(&supplied);
+    const DWORD needed_size = info.cbSize ? info.cbSize : 1;
+    const DWORD needed_align = info.cbAlignment ? info.cbAlignment - 1 : 0;
+    if (!cache.sample || !cache.buffer || cache.size < needed_size ||
+        cache.alignment != needed_align) {
+      cache.Reset();
+      hr = MFCreateSample(&cache.sample);
+      if (FAILED(hr)) return hr;
+      hr = MFCreateAlignedMemoryBuffer(needed_size, needed_align,
+                                       &cache.buffer);
+      if (FAILED(hr)) {
+        cache.Reset();
+        return hr;
+      }
+      hr = cache.sample->AddBuffer(cache.buffer.Get());
+      if (FAILED(hr)) {
+        cache.Reset();
+        return hr;
+      }
+      cache.size = needed_size;
+      cache.alignment = needed_align;
+    } else {
+      DWORD count = 0;
+      if (FAILED(cache.sample->GetBufferCount(&count)) || count != 1) {
+        cache.sample->RemoveAllBuffers();
+        hr = cache.sample->AddBuffer(cache.buffer.Get());
+        if (FAILED(hr)) return hr;
+      }
+      cache.sample->DeleteAllItems();
+    }
+    hr = cache.buffer->SetCurrentLength(0);
     if (FAILED(hr)) return hr;
-    hr = MFCreateAlignedMemoryBuffer(
-        info.cbSize, info.cbAlignment ? info.cbAlignment - 1 : 0, &buffer);
-    if (FAILED(hr)) return hr;
-    hr = supplied->AddBuffer(buffer.Get());
-    if (FAILED(hr)) return hr;
+    supplied = cache.sample;
   }
   MFT_OUTPUT_DATA_BUFFER output{};
   output.dwStreamID = stream_id;
@@ -94,9 +166,22 @@ HRESULT ReadOutput(IMFTransform* transform, DWORD stream_id,
   return hr;
 }
 
+HRESULT ReadOutput(IMFTransform* transform, DWORD stream_id,
+                   ComPtr<IMFSample>& sample) {
+  ReusableOutputSample temp_cache;
+  return ReadOutput(transform, stream_id, temp_cache, sample);
+}
+
 HRESULT ReadBytes(IMFSample* sample, std::vector<uint8_t>& bytes) {
+  if (!sample) return E_INVALIDARG;
   ComPtr<IMFMediaBuffer> buffer;
-  HRESULT hr = sample->ConvertToContiguousBuffer(&buffer);
+  DWORD buffer_count = 0;
+  HRESULT hr = sample->GetBufferCount(&buffer_count);
+  if (SUCCEEDED(hr) && buffer_count == 1) {
+    hr = sample->GetBufferByIndex(0, &buffer);
+  } else {
+    hr = sample->ConvertToContiguousBuffer(&buffer);
+  }
   if (FAILED(hr)) return hr;
   BYTE* data = nullptr;
   DWORD size = 0;

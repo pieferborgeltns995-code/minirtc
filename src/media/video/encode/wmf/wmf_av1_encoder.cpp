@@ -232,6 +232,7 @@ class WmfAv1Encoder::Impl {
   explicit Impl(std::shared_ptr<SystemClock> clock)
       : clock_(std::move(clock)) {}
   ~Impl() {
+    callback_worker_.Flush();
     worker_.Call([this] {
       Reset();
       d3d_device_.Reset();
@@ -247,6 +248,7 @@ class WmfAv1Encoder::Impl {
     }
     dxgi_buffer_cache_.clear();
     reusable_input_sample_.Reset();
+    reusable_output_sample_.Reset();
     dxgi_manager_.Reset();
     dxgi_reset_token_ = 0;
     using_d3d11_ = false;
@@ -793,15 +795,18 @@ class WmfAv1Encoder::Impl {
       }
       if (have_output) {
         ComPtr<IMFSample> output;
-        hr = wmf::ReadOutput(encoder_.Get(), output_id_, output);
+        hr = wmf::ReadOutput(encoder_.Get(), output_id_,
+                             reusable_output_sample_, output);
         if (hr == MF_E_TRANSFORM_STREAM_CHANGE) {
+          reusable_output_sample_.Reset();
           ComPtr<IMFMediaType> type;
           hr = encoder_->GetOutputAvailableType(output_id_, 0, &type);
           if (FAILED(hr)) return hr;
           hr = encoder_->SetOutputType(output_id_, type.Get(), 0);
           if (FAILED(hr)) return hr;
           if (async_) continue;
-          hr = wmf::ReadOutput(encoder_.Get(), output_id_, output);
+          hr = wmf::ReadOutput(encoder_.Get(), output_id_,
+                               reusable_output_sample_, output);
         }
         if (FAILED(hr) && hr != MF_E_TRANSFORM_NEED_MORE_INPUT) return hr;
         if (SUCCEEDED(hr) && output) {
@@ -819,6 +824,7 @@ class WmfAv1Encoder::Impl {
   }
 
   wmf::CodecThread worker_;
+  wmf::CallbackThread callback_worker_;
   std::shared_ptr<SystemClock> clock_;
   MediaCodecConfig config_;
   ComPtr<IMFTransform> encoder_;
@@ -837,6 +843,7 @@ class WmfAv1Encoder::Impl {
   };
   std::vector<CachedDxgiBuffer> dxgi_buffer_cache_;
   ComPtr<IMFSample> reusable_input_sample_;
+  wmf::ReusableOutputSample reusable_output_sample_;
   ComPtr<IMFMediaBuffer> reusable_cpu_buffer_;
   DWORD reusable_cpu_buffer_size_ = 0;
   DWORD input_id_ = 0, output_id_ = 0;
@@ -874,6 +881,7 @@ bool WmfAv1Encoder::IsSupported() {
 
 int WmfAv1Encoder::Init(const MediaCodecConfig& config) {
   if (!ValidConfig(config)) return -1;
+  impl_->callback_worker_.Flush();
   return impl_->worker_.Call([&] {
     impl_->fallback_.reset();
     impl_->config_ = config;
@@ -936,8 +944,14 @@ int WmfAv1Encoder::Encode(const RawFrame& raw,
           return 0;
         });
   });
-  for (const auto& frame : frames)
-    if (callback) callback(frame);
+  if (result == 0 && !frames.empty() && callback) {
+    impl_->callback_worker_.Post(
+        [frames = std::move(frames), cb = std::move(callback)]() mutable {
+          for (const auto& frame : frames) {
+            cb(frame);
+          }
+        });
+  }
   return result;
 }
 
