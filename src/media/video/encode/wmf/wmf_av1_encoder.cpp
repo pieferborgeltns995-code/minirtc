@@ -638,6 +638,8 @@ class WmfAv1Encoder::Impl {
     const auto encode_start = std::chrono::steady_clock::now();
     auto encode_submitted = encode_start;
     bool submit_recorded = false;
+    double wait_need_input_ms = 0.0;
+    double process_input_ms = 0.0;
     const MiniRtcNativeVideoFrame* native = raw.NativeFrame();
     const bool is_d3d11_input =
         native && native->type == MiniRtcNativeVideoFrameD3d11Nv12 &&
@@ -778,10 +780,14 @@ class WmfAv1Encoder::Impl {
     bool submitted = false;
     while (std::chrono::steady_clock::now() < deadline) {
       if (!submitted && (!async_ || input_credit_ > 0)) {
+        const auto pi_start = std::chrono::steady_clock::now();
         hr = encoder_->ProcessInput(input_id_, input.Get(), 0);
+        const auto pi_end = std::chrono::steady_clock::now();
+        process_input_ms +=
+            std::chrono::duration<double, std::milli>(pi_end - pi_start).count();
         if (SUCCEEDED(hr)) {
           submitted = true;
-          encode_submitted = std::chrono::steady_clock::now();
+          encode_submitted = pi_end;
           submit_recorded = true;
           if (async_) --input_credit_;
         } else if (hr != MF_E_NOTACCEPTING) {
@@ -793,7 +799,14 @@ class WmfAv1Encoder::Impl {
         ComPtr<IMFMediaEvent> event;
         const DWORD wait_flag =
             (!submitted && input_credit_ > 0) ? MF_EVENT_FLAG_NO_WAIT : 0;
+        const auto ev_start = std::chrono::steady_clock::now();
         hr = events_->GetEvent(wait_flag, &event);
+        const auto ev_end = std::chrono::steady_clock::now();
+        if (!submitted) {
+          wait_need_input_ms +=
+              std::chrono::duration<double, std::milli>(ev_end - ev_start)
+                  .count();
+        }
         if (hr != MF_E_NO_EVENTS_AVAILABLE) {
           if (FAILED(hr)) return hr;
           HRESULT status = S_OK;
@@ -806,10 +819,15 @@ class WmfAv1Encoder::Impl {
           if (type == METransformNeedInput) {
             ++input_credit_;
             if (!submitted && input_credit_ > 0) {
+              const auto pi_start = std::chrono::steady_clock::now();
               hr = encoder_->ProcessInput(input_id_, input.Get(), 0);
+              const auto pi_end = std::chrono::steady_clock::now();
+              process_input_ms +=
+                  std::chrono::duration<double, std::milli>(pi_end - pi_start)
+                      .count();
               if (SUCCEEDED(hr)) {
                 submitted = true;
-                encode_submitted = std::chrono::steady_clock::now();
+                encode_submitted = pi_end;
                 submit_recorded = true;
                 --input_credit_;
               } else if (hr != MF_E_NOTACCEPTING) {
@@ -844,12 +862,6 @@ class WmfAv1Encoder::Impl {
           const double total_ms =
               std::chrono::duration<double, std::milli>(encode_end - encode_start)
                   .count();
-          const double submit_ms =
-              submit_recorded
-                  ? std::chrono::duration<double, std::milli>(encode_submitted -
-                                                              encode_start)
-                        .count()
-                  : total_ms;
           const double hw_ms =
               submit_recorded
                   ? std::chrono::duration<double, std::milli>(encode_end -
@@ -861,8 +873,8 @@ class WmfAv1Encoder::Impl {
           const bool is_key =
               !frames.empty() &&
               frames.back().FrameType() == VideoFrameType::kVideoFrameKey;
-          RecordEncodeStats(encode_end, total_ms, submit_ms, hw_ms,
-                            encoded_bytes, is_key);
+          RecordEncodeStats(encode_end, total_ms, wait_need_input_ms,
+                            process_input_ms, hw_ms, encoded_bytes, is_key);
           return S_OK;
         }
       }
@@ -883,13 +895,14 @@ class WmfAv1Encoder::Impl {
   }
 
   void RecordEncodeStats(std::chrono::steady_clock::time_point now,
-                         double total_ms, double submit_ms, double hw_ms,
-                         size_t bytes, bool keyframe) {
+                         double total_ms, double wait_ms, double input_ms,
+                         double hw_ms, size_t bytes, bool keyframe) {
     if (stat_window_start_.time_since_epoch().count() == 0) {
       stat_window_start_ = now;
     }
     stat_total_ms_.push_back(total_ms);
-    stat_submit_ms_.push_back(submit_ms);
+    stat_wait_ms_.push_back(wait_ms);
+    stat_input_ms_.push_back(input_ms);
     stat_hw_ms_.push_back(hw_ms);
     stat_total_bytes_ += bytes;
     if (keyframe) ++stat_keyframes_;
@@ -902,8 +915,10 @@ class WmfAv1Encoder::Impl {
     const double enc_p95 = Percentile(stat_total_ms_, 0.95);
     const double enc_max =
         *std::max_element(stat_total_ms_.begin(), stat_total_ms_.end());
-    const double sub_p50 = Percentile(stat_submit_ms_, 0.50);
-    const double sub_p95 = Percentile(stat_submit_ms_, 0.95);
+    const double wait_p50 = Percentile(stat_wait_ms_, 0.50);
+    const double wait_p95 = Percentile(stat_wait_ms_, 0.95);
+    const double in_p50 = Percentile(stat_input_ms_, 0.50);
+    const double in_p95 = Percentile(stat_input_ms_, 0.95);
     const double hw_p50 = Percentile(stat_hw_ms_, 0.50);
     const double hw_p95 = Percentile(stat_hw_ms_, 0.95);
     const double avg_kb =
@@ -911,14 +926,15 @@ class WmfAv1Encoder::Impl {
     LOG_INFO(
         "WMF AV1 stats ({:.1f}s): {}x{} d3d11={} frames={} fps={:.1f} kf={} "
         "enc_ms[p50={:.2f} p95={:.2f} max={:.2f}] "
-        "submit_ms[p50={:.2f} p95={:.2f}] hw_ms[p50={:.2f} p95={:.2f}] "
-        "avg_kb={:.1f}",
+        "wait_ms[p50={:.2f} p95={:.2f}] input_ms[p50={:.2f} p95={:.2f}] "
+        "hw_ms[p50={:.2f} p95={:.2f}] avg_kb={:.1f}",
         elapsed_s, encode_width_, encode_height_, using_d3d11_, n,
         static_cast<double>(n) / elapsed_s, stat_keyframes_, enc_p50, enc_p95,
-        enc_max, sub_p50, sub_p95, hw_p50, hw_p95, avg_kb);
+        enc_max, wait_p50, wait_p95, in_p50, in_p95, hw_p50, hw_p95, avg_kb);
     stat_window_start_ = now;
     stat_total_ms_.clear();
-    stat_submit_ms_.clear();
+    stat_wait_ms_.clear();
+    stat_input_ms_.clear();
     stat_hw_ms_.clear();
     stat_total_bytes_ = 0;
     stat_keyframes_ = 0;
@@ -963,7 +979,8 @@ class WmfAv1Encoder::Impl {
   std::unique_ptr<SvtAv1Encoder> fallback_;
   std::chrono::steady_clock::time_point stat_window_start_;
   std::vector<double> stat_total_ms_;
-  std::vector<double> stat_submit_ms_;
+  std::vector<double> stat_wait_ms_;
+  std::vector<double> stat_input_ms_;
   std::vector<double> stat_hw_ms_;
   size_t stat_total_bytes_ = 0;
   uint64_t stat_keyframes_ = 0;
