@@ -151,6 +151,7 @@ void IceTransportController::Create(bool offer_peer, std::string remote_user_id,
 
   task_queue_cc_ = std::make_shared<TaskQueue>("congest control");
   task_queue_pacer_ = std::make_shared<TaskQueue>("pacer");
+  pending_encode_frame_tasks_ = std::make_shared<std::atomic<uint32_t>>(0);
   task_queue_encode_ = std::make_shared<TaskQueueLockFree>("encode");
   task_queue_decode_ = std::make_shared<TaskQueueLockFree>("decode");
   task_queue_trans_fb_ =
@@ -769,7 +770,10 @@ int IceTransportController::SendVideo(const MiniRtcVideoFrame* video_frame,
     // Reject coalesced frames before copying the full desktop buffer. At 4K,
     // copying frames that are known to be dropped can consume hundreds of MB/s
     // and slow the capture callback itself below its configured frame rate.
-    if (task_queue_encode_->PendingTasks() > 0) {
+    // Track only queued video frame tasks so control tasks (e.g. BWE bitrate
+    // updates) on the same queue do not trigger false frame drops.
+    if (pending_encode_frame_tasks_ &&
+        pending_encode_frame_tasks_->load(std::memory_order_acquire) > 0) {
       context->encode_queue_dropped_frame_total.fetch_add(
           1, std::memory_order_relaxed);
       return 0;
@@ -889,99 +893,121 @@ int IceTransportController::SendVideo(const MiniRtcVideoFrame* video_frame,
         context->target_height.value_or(source_height));
     const int target_width = target_resolution.first;
     const int target_height = target_resolution.second;
-    auto post_encode = [weak_self, weak_context, encode_queue, channel_name,
-                        force_i_frame, target_width, target_height,
-                        settings_generation](RawFrame&& frame) mutable {
-      encode_queue->PostTask([weak_self, weak_context, encode_queue,
-                              channel_name, force_i_frame, target_width,
-                              target_height, settings_generation,
-                              frame = std::move(frame)]() mutable {
-        auto self = weak_self.lock();
-        auto context = weak_context.lock();
-        if (!self || !context || !self->is_running_.load()) {
-          return;
+    struct PendingEncodeTaskGuard {
+      std::shared_ptr<std::atomic<uint32_t>> counter;
+      bool armed = false;
+      explicit PendingEncodeTaskGuard(std::shared_ptr<std::atomic<uint32_t>> c)
+          : counter(std::move(c)) {
+        if (counter) {
+          counter->fetch_add(1, std::memory_order_acq_rel);
+          armed = true;
         }
-
-        {
-          std::shared_lock lock(self->stream_senders_mutex_);
-          if (self->video_send_paused_ ||
-              context->video_settings_generation != settings_generation) return;
+      }
+      PendingEncodeTaskGuard(PendingEncodeTaskGuard&& other) noexcept
+          : counter(std::move(other.counter)), armed(other.armed) {
+        other.armed = false;
+      }
+      PendingEncodeTaskGuard& operator=(PendingEncodeTaskGuard&&) = delete;
+      PendingEncodeTaskGuard(const PendingEncodeTaskGuard&) = delete;
+      PendingEncodeTaskGuard& operator=(const PendingEncodeTaskGuard&) = delete;
+      void Release() {
+        if (armed && counter) {
+          counter->fetch_sub(1, std::memory_order_acq_rel);
+          armed = false;
         }
-        // The transport may have become unavailable after frame admission.
-        // Restore the request consumed above so the next frame can resync.
-        if (!self->media_transport_ready_.load()) {
-          self->FullIntraRequest(channel_name);
-          return;
-        }
-
-        if (!context->codec) {
-          return;
-        }
-        const bool needs_scaling =
-            target_width > 0 && target_height > 0 &&
-            (target_width < frame.Width() || target_height < frame.Height());
-        if (const auto* native_frame = frame.NativeFrame();
-            native_frame &&
-            (needs_scaling ||
-             !context->codec->SupportsNativeFrameInput(native_frame->type))) {
-          if (!frame.MaterializeNativeFrame()) {
-            LOG_ERROR("Failed to materialize native video frame for stream [{}]",
-                      channel_name);
-            return;
-          }
-        }
-        if (needs_scaling) {
-          RawFrame scaled_frame(static_cast<size_t>(target_width) *
-                                    target_height * 3 / 2);
-          scaled_frame.SetCapturedTimestamp(frame.CapturedTimestamp());
-          if (self->resolution_adapter_->ResolutionDowngrade(
-                  frame, target_width, target_height, scaled_frame) != 0) {
-            LOG_ERROR("Failed to scale video frame from [{}x{}] to [{}x{}]",
-                      frame.Width(), frame.Height(), target_width,
-                      target_height);
-            return;
-          }
-          frame = std::move(scaled_frame);
-        }
-        int64_t queue_delay_ms = encode_queue->CurrentTaskQueueDelayMs();
-        if (force_i_frame) {
-          if (context->codec->ForceIdr() != 0) {
-            // Keep the request pending so a transient encoder failure cannot
-            // turn a recoverable loss into a long wait for the periodic IDR.
-            std::lock_guard<std::mutex> lock(
-                self->force_i_frame_streams_mutex_);
-            self->force_i_frame_streams_.insert(channel_name);
-            LOG_ERROR("Failed to force I frame for stream [{}]", channel_name);
-          } else {
-            LOG_DEBUG("Force I frame for stream [{}]", channel_name);
-          }
-        }
-        context->codec->Encode(
-            std::move(frame),
-            [weak_self, weak_context, channel_name, queue_delay_ms,
-             settings_generation, is_first_callback = true](
-                const EncodedFrame& encoded_frame) mutable -> int {
-              auto self = weak_self.lock();
-              auto context = weak_context.lock();
-              if (!self || !context || !self->is_running_.load()) {
-                return -1;
-              }
-
-              {
-                std::shared_lock lock(self->stream_senders_mutex_);
-                if (context->video_settings_generation != settings_generation)
-                  return 0;
-              }
-              const bool measure_encode_delay = is_first_callback;
-              is_first_callback = false;
-              return self->OnVideoEncoded(
-                  channel_name, context, static_cast<int>(queue_delay_ms),
-                  measure_encode_delay, encoded_frame, settings_generation);
-            });
-      });
+      }
+      ~PendingEncodeTaskGuard() { Release(); }
     };
+    PendingEncodeTaskGuard pending_guard(pending_encode_frame_tasks_);
+    encode_queue->PostTask([weak_self, weak_context, encode_queue, channel_name,
+                            force_i_frame, target_width, target_height,
+                            settings_generation,
+                            pending_guard = std::move(pending_guard),
+                            frame = std::move(raw_frame)]() mutable {
+      pending_guard.Release();
+      auto self = weak_self.lock();
+      auto context = weak_context.lock();
+      if (!self || !context || !self->is_running_.load()) {
+        return;
+      }
 
-    post_encode(std::move(raw_frame));
+      {
+        std::shared_lock lock(self->stream_senders_mutex_);
+        if (self->video_send_paused_ ||
+            context->video_settings_generation != settings_generation) return;
+      }
+      // The transport may have become unavailable after frame admission.
+      // Restore the request consumed above so the next frame can resync.
+      if (!self->media_transport_ready_.load()) {
+        self->FullIntraRequest(channel_name);
+        return;
+      }
+
+      if (!context->codec) {
+        return;
+      }
+      const bool needs_scaling =
+          target_width > 0 && target_height > 0 &&
+          (target_width < frame.Width() || target_height < frame.Height());
+      if (const auto* native_frame = frame.NativeFrame();
+          native_frame &&
+          (needs_scaling ||
+           !context->codec->SupportsNativeFrameInput(native_frame->type))) {
+        if (!frame.MaterializeNativeFrame()) {
+          LOG_ERROR("Failed to materialize native video frame for stream [{}]",
+                    channel_name);
+          return;
+        }
+      }
+      if (needs_scaling) {
+        RawFrame scaled_frame(static_cast<size_t>(target_width) *
+                                  target_height * 3 / 2);
+        scaled_frame.SetCapturedTimestamp(frame.CapturedTimestamp());
+        if (self->resolution_adapter_->ResolutionDowngrade(
+                frame, target_width, target_height, scaled_frame) != 0) {
+          LOG_ERROR("Failed to scale video frame from [{}x{}] to [{}x{}]",
+                    frame.Width(), frame.Height(), target_width,
+                    target_height);
+          return;
+        }
+        frame = std::move(scaled_frame);
+      }
+      int64_t queue_delay_ms = encode_queue->CurrentTaskQueueDelayMs();
+      if (force_i_frame) {
+        if (context->codec->ForceIdr() != 0) {
+          // Keep the request pending so a transient encoder failure cannot
+          // turn a recoverable loss into a long wait for the periodic IDR.
+          std::lock_guard<std::mutex> lock(
+              self->force_i_frame_streams_mutex_);
+          self->force_i_frame_streams_.insert(channel_name);
+          LOG_ERROR("Failed to force I frame for stream [{}]", channel_name);
+        } else {
+          LOG_DEBUG("Force I frame for stream [{}]", channel_name);
+        }
+      }
+      context->codec->Encode(
+          std::move(frame),
+          [weak_self, weak_context, channel_name, queue_delay_ms,
+           settings_generation, is_first_callback = true](
+              const EncodedFrame& encoded_frame) mutable -> int {
+            auto self = weak_self.lock();
+            auto context = weak_context.lock();
+            if (!self || !context || !self->is_running_.load()) {
+              return -1;
+            }
+
+            {
+              std::shared_lock lock(self->stream_senders_mutex_);
+              if (context->video_settings_generation != settings_generation)
+                return 0;
+            }
+            const bool measure_encode_delay = is_first_callback;
+            is_first_callback = false;
+            return self->OnVideoEncoded(
+                channel_name, context, static_cast<int>(queue_delay_ms),
+                measure_encode_delay, encoded_frame, settings_generation);
+          });
+    });
   }
 
   return 0;

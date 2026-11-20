@@ -535,6 +535,7 @@ class IceTransportController
   std::shared_ptr<TaskQueue> task_queue_cc_;
   std::shared_ptr<TaskQueue> task_queue_pacer_;
   std::shared_ptr<TaskQueueLockFree> task_queue_encode_;
+  std::shared_ptr<std::atomic<uint32_t>> pending_encode_frame_tasks_;
   std::shared_ptr<TaskQueueLockFree> task_queue_decode_;
   std::shared_ptr<TaskQueueLockFree> task_queue_trans_fb_;
   webrtc::DataSize congestion_window_size_;
