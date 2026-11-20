@@ -6,8 +6,8 @@
 
 namespace minirtc {
 
-inline constexpr int kDefaultMaxNetworkBitrateBps = 20'000'000;
-inline constexpr int kDefaultMaxEncoderBitrateBps = 30'000'000;
+inline constexpr int kDefaultMaxNetworkBitrateBps = 50'000'000;
+inline constexpr int kDefaultMaxEncoderBitrateBps = 75'000'000;
 inline constexpr int kMaxEncoderOvershootPercent = 50;
 
 inline int ClampEncoderTargetBitrate(int bitrate, int max_bitrate) {
