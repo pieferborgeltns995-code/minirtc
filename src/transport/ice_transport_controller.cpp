@@ -1990,6 +1990,66 @@ int IceTransportController::OnVideoEncoded(
       return 0;
     }
     const int64_t now_ms = clock_->CurrentTimeMs();
+    if (context->telemetry_window_started_ms == 0) {
+      context->telemetry_window_started_ms = now_ms;
+      context->telemetry_capture_start =
+          context->capture_input_frame_total.load(std::memory_order_acquire);
+      context->telemetry_pacer_rejected_start =
+          context->pacer_rejected_frame_total.load(std::memory_order_acquire);
+      context->telemetry_encode_queue_dropped_start =
+          context->encode_queue_dropped_frame_total.load(
+              std::memory_order_acquire);
+      context->telemetry_encoded_frames = 0;
+      context->telemetry_key_frames = 0;
+      context->telemetry_encoded_bytes = 0;
+    } else {
+      ++context->telemetry_encoded_frames;
+      if (keyframe) ++context->telemetry_key_frames;
+      context->telemetry_encoded_bytes += encoded_frame.Size();
+      const int64_t telemetry_elapsed_ms =
+          now_ms - context->telemetry_window_started_ms;
+      if (telemetry_elapsed_ms >= 5000) {
+        const uint64_t cap_now =
+            context->capture_input_frame_total.load(std::memory_order_acquire);
+        const uint64_t pacer_rej_now = context->pacer_rejected_frame_total.load(
+            std::memory_order_acquire);
+        const uint64_t enc_drop_now =
+            context->encode_queue_dropped_frame_total.load(
+                std::memory_order_acquire);
+        const uint64_t cap_delta = cap_now - context->telemetry_capture_start;
+        const uint64_t pacer_rej_delta =
+            pacer_rej_now - context->telemetry_pacer_rejected_start;
+        const uint64_t enc_drop_delta =
+            enc_drop_now - context->telemetry_encode_queue_dropped_start;
+        const double elapsed_s = static_cast<double>(telemetry_elapsed_ms) / 1000.0;
+        const int64_t pacer_q_ms =
+            paced_sender_ ? paced_sender_->ExpectedQueueTime().ms() : 0;
+        const double bitrate_mbps =
+            static_cast<double>(context->telemetry_encoded_bytes * 8ULL) /
+            (elapsed_s * 1'000'000.0);
+        LOG_INFO(
+            "Video pipeline stats ({:.1f}s): channel={} cap_fps={:.1f} "
+            "enc_fps={:.1f} kf={} pacer_rej={} enc_q_drop={} pacer_q_ms={} "
+            "q_delay_ms={} target_bps={} actual_mbps={:.2f} loss_pct={} "
+            "rtt_ms={} alr={}",
+            elapsed_s, channel_name,
+            static_cast<double>(cap_delta) / elapsed_s,
+            static_cast<double>(context->telemetry_encoded_frames) / elapsed_s,
+            context->telemetry_key_frames, pacer_rej_delta, enc_drop_delta,
+            pacer_q_ms, queue_delay_ms,
+            context->applied_target_bitrate.value_or(
+                context->desired_target_bitrate.value_or(0)),
+            bitrate_mbps, context->last_network_loss_pct,
+            context->last_network_rtt_ms, context->last_network_in_alr);
+        context->telemetry_window_started_ms = now_ms;
+        context->telemetry_capture_start = cap_now;
+        context->telemetry_pacer_rejected_start = pacer_rej_now;
+        context->telemetry_encode_queue_dropped_start = enc_drop_now;
+        context->telemetry_encoded_frames = 0;
+        context->telemetry_key_frames = 0;
+        context->telemetry_encoded_bytes = 0;
+      }
+    }
     if (context->startup_keyframe_pending &&
         (context->resolution_upgrade_network_blocked ||
          now_ms - context->startup_keyframe_started_ms >=
@@ -3458,6 +3518,16 @@ void IceTransportController::PostUpdates(webrtc::NetworkControlUpdate update) {
             VideoAdaptationPolicy::IsStaticContentNetworkCritical(
                 network_estimate.loss_rate_ratio, network_rtt_ms);
         for (auto& [channel_name, context] : stream_senders_) {
+          if (context && context->type == StreamType::kVideo) {
+            context->last_network_rtt_ms =
+                network_estimate.round_trip_time.IsFinite()
+                    ? network_estimate.round_trip_time.ms()
+                    : -1;
+            context->last_network_loss_pct =
+                static_cast<int>(network_estimate.loss_rate_ratio * 100.0f +
+                                 0.5f);
+            context->last_network_in_alr = network_estimate.in_alr;
+          }
           if (!context->codec || context->type != StreamType::kVideo ||
               !context->last_active_time ||
               clock_->CurrentTimeMs() - *context->last_active_time >= 100) {

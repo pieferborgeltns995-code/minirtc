@@ -339,6 +339,16 @@ class IceTransportController
     int64_t severe_encode_backlog_since_ms = 0;
     int64_t critical_encode_backlog_since_ms = 0;
     int64_t post_upgrade_protection_until_ms = 0;
+    int64_t telemetry_window_started_ms = 0;
+    uint64_t telemetry_capture_start = 0;
+    uint64_t telemetry_pacer_rejected_start = 0;
+    uint64_t telemetry_encode_queue_dropped_start = 0;
+    int telemetry_encoded_frames = 0;
+    int telemetry_key_frames = 0;
+    size_t telemetry_encoded_bytes = 0;
+    int64_t last_network_rtt_ms = -1;
+    int last_network_loss_pct = 0;
+    bool last_network_in_alr = false;
 
     void FinishStartupKeyframe() {
       startup_keyframe_pending = false;

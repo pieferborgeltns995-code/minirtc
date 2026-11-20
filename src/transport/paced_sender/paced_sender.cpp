@@ -13,10 +13,11 @@ webrtc::PacingController::Configuration LowLatencyPacingConfiguration(
     bool bounded_video_queue) {
   auto configuration =
       webrtc::PacingController::DefaultConfiguration();
-  // A fresh key frame supersedes queued desktop deltas. Flushing those older
-  // packets prevents a recovery frame from sitting behind content that can no
-  // longer be decoded usefully.
-  configuration.keyframe_flushing = true;
+  // Frame admission bounds queued video before RTP packetization. Flushing
+  // already-packetized RTP packets out of the pacer on a keyframe creates
+  // sequence-number gaps that RFC 8888 feedback reports as packet loss and
+  // triggers "Failed to lookup send time" warnings / spurious BWE drops.
+  configuration.keyframe_flushing = false;
   // Frame admission and key-frame size limits bound desktop queues. Draining
   // them faster than the configured pacing rate would undo those budgets.
   configuration.drain_large_queues = !bounded_video_queue;

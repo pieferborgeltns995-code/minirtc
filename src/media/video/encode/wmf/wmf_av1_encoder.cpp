@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <limits>
 #include <thread>
@@ -634,6 +635,9 @@ class WmfAv1Encoder::Impl {
 
   HRESULT EncodeHardware(const RawFrame& raw,
                          std::vector<EncodedFrame>& frames) {
+    const auto encode_start = std::chrono::steady_clock::now();
+    auto encode_submitted = encode_start;
+    bool submit_recorded = false;
     const MiniRtcNativeVideoFrame* native = raw.NativeFrame();
     const bool is_d3d11_input =
         native && native->type == MiniRtcNativeVideoFrameD3d11Nv12 &&
@@ -646,10 +650,21 @@ class WmfAv1Encoder::Impl {
           static_cast<int>(native->payload.d3d11_nv12.texture_width);
       const int tex_h =
           static_cast<int>(native->payload.d3d11_nv12.texture_height);
-      if (static_cast<int>(raw.Width()) != source_width_ ||
-          static_cast<int>(raw.Height()) != source_height_ || !using_d3d11_ ||
-          dev != d3d_device_.Get() || tex_w != d3d_tex_width_ ||
-          tex_h != d3d_tex_height_ || reconfigure_) {
+      const bool size_changed = static_cast<int>(raw.Width()) != source_width_ ||
+                                static_cast<int>(raw.Height()) != source_height_;
+      const bool switched_d3d11 = !using_d3d11_;
+      const bool dev_changed = dev != d3d_device_.Get();
+      const bool tex_changed = tex_w != d3d_tex_width_ || tex_h != d3d_tex_height_;
+      if (size_changed || switched_d3d11 || dev_changed || tex_changed ||
+          reconfigure_) {
+        if (sequence_ > 0) {
+          LOG_INFO(
+              "Reinitializing WMF AV1 encoder (D3D11): size_chg={} "
+              "to_d3d11={} dev_chg={} tex_chg={} reconfig={} {}x{}->{}x{}",
+              size_changed, switched_d3d11, dev_changed, tex_changed,
+              reconfigure_, source_width_, source_height_, raw.Width(),
+              raw.Height());
+        }
         source_width_ = static_cast<int>(raw.Width());
         source_height_ = static_cast<int>(raw.Height());
         config_.init_width = source_width_;
@@ -661,9 +676,17 @@ class WmfAv1Encoder::Impl {
         if (FAILED(hr)) return hr;
       }
     } else {
-      if (static_cast<int>(raw.Width()) != source_width_ ||
-          static_cast<int>(raw.Height()) != source_height_ || using_d3d11_ ||
-          reconfigure_) {
+      const bool size_changed = static_cast<int>(raw.Width()) != source_width_ ||
+                                static_cast<int>(raw.Height()) != source_height_;
+      const bool switched_cpu = using_d3d11_;
+      if (size_changed || switched_cpu || reconfigure_) {
+        if (sequence_ > 0) {
+          LOG_INFO(
+              "Reinitializing WMF AV1 encoder (CPU): size_chg={} to_cpu={} "
+              "reconfig={} {}x{}->{}x{}",
+              size_changed, switched_cpu, reconfigure_, source_width_,
+              source_height_, raw.Width(), raw.Height());
+        }
         source_width_ = static_cast<int>(raw.Width());
         source_height_ = static_cast<int>(raw.Height());
         config_.init_width = source_width_;
@@ -758,6 +781,8 @@ class WmfAv1Encoder::Impl {
         hr = encoder_->ProcessInput(input_id_, input.Get(), 0);
         if (SUCCEEDED(hr)) {
           submitted = true;
+          encode_submitted = std::chrono::steady_clock::now();
+          submit_recorded = true;
           if (async_) --input_credit_;
         } else if (hr != MF_E_NOTACCEPTING) {
           return hr;
@@ -784,6 +809,8 @@ class WmfAv1Encoder::Impl {
               hr = encoder_->ProcessInput(input_id_, input.Get(), 0);
               if (SUCCEEDED(hr)) {
                 submitted = true;
+                encode_submitted = std::chrono::steady_clock::now();
+                submit_recorded = true;
                 --input_credit_;
               } else if (hr != MF_E_NOTACCEPTING) {
                 return hr;
@@ -813,6 +840,29 @@ class WmfAv1Encoder::Impl {
           hr = ReadFrame(output.Get(), raw, frames);
           if (FAILED(hr)) return hr;
           ++sequence_;
+          const auto encode_end = std::chrono::steady_clock::now();
+          const double total_ms =
+              std::chrono::duration<double, std::milli>(encode_end - encode_start)
+                  .count();
+          const double submit_ms =
+              submit_recorded
+                  ? std::chrono::duration<double, std::milli>(encode_submitted -
+                                                              encode_start)
+                        .count()
+                  : total_ms;
+          const double hw_ms =
+              submit_recorded
+                  ? std::chrono::duration<double, std::milli>(encode_end -
+                                                              encode_submitted)
+                        .count()
+                  : 0.0;
+          const size_t encoded_bytes =
+              frames.empty() ? 0 : frames.back().Size();
+          const bool is_key =
+              !frames.empty() &&
+              frames.back().FrameType() == VideoFrameType::kVideoFrameKey;
+          RecordEncodeStats(encode_end, total_ms, submit_ms, hw_ms,
+                            encoded_bytes, is_key);
           return S_OK;
         }
       }
@@ -821,6 +871,57 @@ class WmfAv1Encoder::Impl {
       }
     }
     return HRESULT_FROM_WIN32(WAIT_TIMEOUT);
+  }
+
+  static double Percentile(std::vector<double>& samples, double pct) {
+    if (samples.empty()) return 0.0;
+    const size_t idx = std::min(
+        samples.size() - 1,
+        static_cast<size_t>(pct * static_cast<double>(samples.size() - 1)));
+    std::nth_element(samples.begin(), samples.begin() + idx, samples.end());
+    return samples[idx];
+  }
+
+  void RecordEncodeStats(std::chrono::steady_clock::time_point now,
+                         double total_ms, double submit_ms, double hw_ms,
+                         size_t bytes, bool keyframe) {
+    if (stat_window_start_.time_since_epoch().count() == 0) {
+      stat_window_start_ = now;
+    }
+    stat_total_ms_.push_back(total_ms);
+    stat_submit_ms_.push_back(submit_ms);
+    stat_hw_ms_.push_back(hw_ms);
+    stat_total_bytes_ += bytes;
+    if (keyframe) ++stat_keyframes_;
+    const double elapsed_s =
+        std::chrono::duration<double>(now - stat_window_start_).count();
+    if (elapsed_s < 5.0 || stat_total_ms_.empty()) return;
+
+    const size_t n = stat_total_ms_.size();
+    const double enc_p50 = Percentile(stat_total_ms_, 0.50);
+    const double enc_p95 = Percentile(stat_total_ms_, 0.95);
+    const double enc_max =
+        *std::max_element(stat_total_ms_.begin(), stat_total_ms_.end());
+    const double sub_p50 = Percentile(stat_submit_ms_, 0.50);
+    const double sub_p95 = Percentile(stat_submit_ms_, 0.95);
+    const double hw_p50 = Percentile(stat_hw_ms_, 0.50);
+    const double hw_p95 = Percentile(stat_hw_ms_, 0.95);
+    const double avg_kb =
+        static_cast<double>(stat_total_bytes_) / (static_cast<double>(n) * 1024.0);
+    LOG_INFO(
+        "WMF AV1 stats ({:.1f}s): {}x{} d3d11={} frames={} fps={:.1f} kf={} "
+        "enc_ms[p50={:.2f} p95={:.2f} max={:.2f}] "
+        "submit_ms[p50={:.2f} p95={:.2f}] hw_ms[p50={:.2f} p95={:.2f}] "
+        "avg_kb={:.1f}",
+        elapsed_s, encode_width_, encode_height_, using_d3d11_, n,
+        static_cast<double>(n) / elapsed_s, stat_keyframes_, enc_p50, enc_p95,
+        enc_max, sub_p50, sub_p95, hw_p50, hw_p95, avg_kb);
+    stat_window_start_ = now;
+    stat_total_ms_.clear();
+    stat_submit_ms_.clear();
+    stat_hw_ms_.clear();
+    stat_total_bytes_ = 0;
+    stat_keyframes_ = 0;
   }
 
   wmf::CodecThread worker_;
@@ -860,6 +961,12 @@ class WmfAv1Encoder::Impl {
   std::vector<uint8_t> cpu_materialize_buf_;
   std::vector<uint8_t> scaler_scratch_;
   std::unique_ptr<SvtAv1Encoder> fallback_;
+  std::chrono::steady_clock::time_point stat_window_start_;
+  std::vector<double> stat_total_ms_;
+  std::vector<double> stat_submit_ms_;
+  std::vector<double> stat_hw_ms_;
+  size_t stat_total_bytes_ = 0;
+  uint64_t stat_keyframes_ = 0;
 };
 
 WmfAv1Encoder::WmfAv1Encoder(std::shared_ptr<SystemClock> clock)
@@ -966,15 +1073,21 @@ int WmfAv1Encoder::SetTargetBitrate(int bitrate) {
   if (bitrate <= 0) return -1;
   return impl_->worker_.Call([&] {
     bitrate = ClampEncoderTargetBitrate(bitrate, impl_->config_.max_bitrate);
+    const int min_supported = std::min(10000, impl_->config_.max_bitrate);
+    bitrate = std::max(bitrate, min_supported);
     if (impl_->fallback_) {
       const int result = impl_->fallback_->SetTargetBitrate(bitrate);
       if (result == 0) impl_->config_.init_bitrate = bitrate;
       return result;
     }
     if (!impl_->api_) return -1;
-    if (FAILED(SetUint(impl_->api_.Get(), CODECAPI_AVEncCommonMeanBitRate,
-                       bitrate)))
-      impl_->reconfigure_ = true;
+    if (bitrate == impl_->config_.init_bitrate) return 0;
+    const HRESULT hr =
+        SetUint(impl_->api_.Get(), CODECAPI_AVEncCommonMeanBitRate, bitrate);
+    if (FAILED(hr)) {
+      LOG_WARN("WMF AV1 SetUint MeanBitRate({}) failed: 0x{:08x}", bitrate,
+               static_cast<uint32_t>(hr));
+    }
     impl_->config_.init_bitrate = bitrate;
     return 0;
   });
