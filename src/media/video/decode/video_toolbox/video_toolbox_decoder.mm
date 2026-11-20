@@ -950,8 +950,17 @@ bool VideoToolboxDecoder::Impl::CreateDecompressionSessionFromFormatDesc() {
   if (status != noErr) {
     LOG_ERROR("Failed to create VideoToolbox decompression session, status: {}",
               status);
+    return false;
   }
-  return status == noErr;
+  const OSStatus rt_status = VTSessionSetProperty(
+      decompression_session_, kVTDecompressionPropertyKey_RealTime,
+      kCFBooleanTrue);
+  if (rt_status != noErr) {
+    LOG_WARN(
+        "Failed to set VideoToolbox real-time decompression property: {}",
+        rt_status);
+  }
+  return true;
 }
 
 CVPixelBufferRef VideoToolboxDecoder::Impl::CreateCroppedPixelBuffer(
