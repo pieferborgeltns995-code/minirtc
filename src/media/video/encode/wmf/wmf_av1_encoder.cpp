@@ -44,6 +44,36 @@ HRESULT SetUint(ICodecAPI* api, const GUID& key, ULONG value) {
   return api->SetValue(&key, &variant);
 }
 
+ULONG ComputeVbvBufferBytes(int bitrate) {
+  // Cap VBV bit reservoir to ~67 ms (~4 frames at 60 fps) so static->motion
+  // transitions cannot burst a 600+ KB frame into the pacer and decoder.
+  return std::clamp<ULONG>(static_cast<ULONG>(std::max(0, bitrate) / 120),
+                           65536UL, 2097152UL);
+}
+
+void ApplyMeanBitrateAndBuffer(ICodecAPI* api, int bitrate,
+                               bool warn_on_failure) {
+  if (!api || bitrate <= 0) return;
+  const HRESULT br_hr =
+      SetUint(api, CODECAPI_AVEncCommonMeanBitRate, bitrate);
+  if (FAILED(br_hr)) {
+    if (warn_on_failure) {
+      LOG_WARN("WMF AV1 SetUint MeanBitRate({}) failed: 0x{:08x}", bitrate,
+               static_cast<uint32_t>(br_hr));
+    } else {
+      LOG_DEBUG("WMF AV1 SetUint MeanBitRate failed: 0x{:08x}",
+                static_cast<uint32_t>(br_hr));
+    }
+  }
+  const ULONG buffer_bytes = ComputeVbvBufferBytes(bitrate);
+  const HRESULT buf_hr =
+      SetUint(api, CODECAPI_AVEncCommonBufferSize, buffer_bytes);
+  if (FAILED(buf_hr)) {
+    LOG_DEBUG("WMF AV1 SetUint BufferSize({}) failed: 0x{:08x}", buffer_bytes,
+              static_cast<uint32_t>(buf_hr));
+  }
+}
+
 HRESULT EnumerateEncoders(IMFActivate*** activates, UINT32* count) {
   MFT_REGISTER_TYPE_INFO input{MFMediaType_Video, MFVideoFormat_NV12};
   MFT_REGISTER_TYPE_INFO output{MFMediaType_Video, kVideoFormatAv1};
@@ -403,12 +433,7 @@ class WmfAv1Encoder::Impl {
     if (FAILED(hr)) return hr;
 
     if (api_) {
-      HRESULT br_hr = SetUint(api_.Get(), CODECAPI_AVEncCommonMeanBitRate,
-                              config_.init_bitrate);
-      if (FAILED(br_hr)) {
-        LOG_DEBUG("WMF AV1 SetUint MeanBitRate failed: 0x{:08x}",
-                  static_cast<uint32_t>(br_hr));
-      }
+      ApplyMeanBitrateAndBuffer(api_.Get(), config_.init_bitrate, false);
     }
     hr = encoder_->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
     if (FAILED(hr)) return hr;
@@ -1103,18 +1128,14 @@ int WmfAv1Encoder::SetTargetBitrate(int bitrate) {
     if (bitrate == applied) return 0;
     const bool at_bound =
         bitrate == min_supported || bitrate == impl_->config_.max_bitrate;
-    // Ignore minor BWE fluctuations (<10%) unless hitting a hard bound; AMD's
-    // MFT rate controller can stall >100 ms across frequent MeanBitRate resets.
+    // Ignore minor BWE/FEC fluctuations (<20%, e.g. 0%<->10% FEC toggles)
+    // unless hitting a hard bound; AMD's MFT rate controller can stall >100 ms
+    // across frequent MeanBitRate resets.
     if (!at_bound && applied > 0 &&
-        std::llabs(static_cast<int64_t>(bitrate) - applied) * 10 < applied) {
+        std::llabs(static_cast<int64_t>(bitrate) - applied) * 5 < applied) {
       return 0;
     }
-    const HRESULT hr =
-        SetUint(impl_->api_.Get(), CODECAPI_AVEncCommonMeanBitRate, bitrate);
-    if (FAILED(hr)) {
-      LOG_WARN("WMF AV1 SetUint MeanBitRate({}) failed: 0x{:08x}", bitrate,
-               static_cast<uint32_t>(hr));
-    }
+    ApplyMeanBitrateAndBuffer(impl_->api_.Get(), bitrate, true);
     impl_->config_.init_bitrate = bitrate;
     return 0;
   });

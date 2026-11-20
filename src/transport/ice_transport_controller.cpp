@@ -46,6 +46,22 @@ bool UsesBoundedVideoQueue(const MediaCodecConfig& config) {
              MiniRtcVideoDegradationPreference::MaintainResolution;
 }
 
+int ResolveEncoderTargetBitrate(int requested_bitrate,
+                                std::optional<int> applied_bitrate,
+                                bool in_alr, int loss_pct, bool is_congested,
+                                FecDecision fec_reason) {
+  // Hold the current encoder target bitrate during lossless idle ALR so
+  // probe starvation on static screens does not lower MeanBitRate and trigger
+  // an AMD MFT stall when motion resumes.
+  if (requested_bitrate > 0 && applied_bitrate.has_value() &&
+      requested_bitrate < *applied_bitrate && in_alr && loss_pct == 0 &&
+      !is_congested && fec_reason != FecDecision::kCongested &&
+      fec_reason != FecDecision::kLoss) {
+    return *applied_bitrate;
+  }
+  return requested_bitrate;
+}
+
 }  // namespace
 
 IceTransportController::IceTransportController(
@@ -4121,7 +4137,11 @@ void IceTransportController::UpdateVideoBitrateAllocation() {
       if (context->bitrate_update_queued) {
         continue;
       }
-      if (context->applied_target_bitrate == per_video_bitrate) {
+      const int encoder_target_bitrate = ResolveEncoderTargetBitrate(
+          per_video_bitrate, context->applied_target_bitrate,
+          context->last_network_in_alr, context->last_network_loss_pct,
+          is_congested_.load(), context->fec_protection.reason);
+      if (context->applied_target_bitrate == encoder_target_bitrate) {
         continue;
       }
 
@@ -4178,11 +4198,15 @@ void IceTransportController::ApplyVideoBitrateUpdateOnEncodeQueue(
       return;
     }
 
-    target_bitrate = context->desired_target_bitrate.value();
-    if (target_bitrate <= 0) {
+    const int desired_bitrate = context->desired_target_bitrate.value();
+    if (desired_bitrate <= 0) {
       context->bitrate_update_queued = false;
       return;
     }
+    target_bitrate = ResolveEncoderTargetBitrate(
+        desired_bitrate, context->applied_target_bitrate,
+        context->last_network_in_alr, context->last_network_loss_pct,
+        is_congested_.load(), context->fec_protection.reason);
     if (context->applied_target_bitrate == target_bitrate) {
       context->bitrate_update_queued = false;
       return;
@@ -4205,8 +4229,16 @@ void IceTransportController::ApplyVideoBitrateUpdateOnEncodeQueue(
       context->applied_target_bitrate = target_bitrate;
     }
 
-    if (context->desired_target_bitrate.has_value() &&
-        context->desired_target_bitrate.value() != target_bitrate) {
+    const std::optional<int> next_target =
+        context->desired_target_bitrate.has_value() &&
+                *context->desired_target_bitrate > 0
+            ? std::optional<int>(ResolveEncoderTargetBitrate(
+                  *context->desired_target_bitrate,
+                  context->applied_target_bitrate, context->last_network_in_alr,
+                  context->last_network_loss_pct, is_congested_.load(),
+                  context->fec_protection.reason))
+            : std::nullopt;
+    if (next_target.has_value() && *next_target != target_bitrate) {
       // Keep the in-flight flag set. Reposting at the tail gives frame tasks a
       // chance to run while still converging to the newest desired bitrate.
       post_followup = true;
