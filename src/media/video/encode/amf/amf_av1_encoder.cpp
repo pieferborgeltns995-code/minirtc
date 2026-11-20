@@ -132,7 +132,7 @@ class AmfAv1Encoder::Impl {
     stats_.Reset();
   }
 
-  void ApplyRateControlProperties() {
+  void ApplyRateControlProperties(bool initial_config) {
     if (!encoder_) return;
     const amf_int64 fps = (std::max)(1, config_.max_frame_rate);
     const amf_int64 target_bps = (std::max)(10000, config_.init_bitrate);
@@ -140,10 +140,6 @@ class AmfAv1Encoder::Impl {
         target_bps,
         (std::min)(static_cast<amf_int64>(config_.max_bitrate),
                    target_bps + (target_bps / 2)));
-    // Keep VBV shallow (250ms at target bitrate, floor 2 Mbit) so static-to-motion
-    // transitions recover rapidly without queue buildup.
-    const amf_int64 vbv_bits =
-        (std::max)(target_bps / 4, static_cast<amf_int64>(2'000'000LL));
     // Cap per-frame compressed bursts (1.2 Mbit..3.6 Mbit == 150 KB..450 KB)
     // to prevent desktop motion/IDR spikes from saturating UDP queues.
     const amf_int64 raw_frame_cap = (peak_bps * 3) / fps;
@@ -154,11 +150,22 @@ class AmfAv1Encoder::Impl {
 
     SetOptionalProp(encoder_, AMF_VIDEO_ENCODER_AV1_TARGET_BITRATE, target_bps);
     SetOptionalProp(encoder_, AMF_VIDEO_ENCODER_AV1_PEAK_BITRATE, peak_bps);
-    SetOptionalProp(encoder_, AMF_VIDEO_ENCODER_AV1_VBV_BUFFER_SIZE, vbv_bits);
     SetOptionalProp(encoder_, AMF_VIDEO_ENCODER_AV1_MAX_COMPRESSED_FRAME_SIZE,
                     max_frame_bits);
-    SetOptionalProp(encoder_, AMF_VIDEO_ENCODER_AV1_ENFORCE_HRD, true);
+
+    if (!initial_config) {
+      return;
+    }
+
+    // Keep VBV shallow (250ms at target bitrate, floor 2 Mbit) without rigid
+    // HRD enforcement so static-to-motion transitions recover without VCN stalls.
+    const amf_int64 vbv_bits =
+        (std::max)(target_bps / 4, static_cast<amf_int64>(2'000'000LL));
+    SetOptionalProp(encoder_, AMF_VIDEO_ENCODER_AV1_VBV_BUFFER_SIZE, vbv_bits);
+    SetOptionalProp(encoder_, AMF_VIDEO_ENCODER_AV1_ENFORCE_HRD, false);
     SetOptionalProp(encoder_, AMF_VIDEO_ENCODER_AV1_FILLER_DATA, false);
+    SetOptionalProp(encoder_, AMF_VIDEO_ENCODER_AV1_RATE_CONTROL_SKIP_FRAME,
+                    false);
     SetOptionalProp(encoder_, AMF_VIDEO_ENCODER_AV1_MIN_Q_INDEX_INTRA,
                     static_cast<amf_int64>(20));
     SetOptionalProp(encoder_, AMF_VIDEO_ENCODER_AV1_MIN_Q_INDEX_INTER,
@@ -239,12 +246,14 @@ class AmfAv1Encoder::Impl {
     SetOptionalProp(encoder_, AMF_VIDEO_ENCODER_AV1_SCREEN_CONTENT_TOOLS,
                     true);
     SetOptionalProp(encoder_, AMF_VIDEO_ENCODER_AV1_PALETTE_MODE, true);
+    SetOptionalProp(encoder_, AMF_VIDEO_ENCODER_AV1_TILES_PER_FRAME,
+                    static_cast<amf_int64>(4));
     SetOptionalProp(encoder_, AMF_VIDEO_ENCODER_AV1_INPUT_QUEUE_SIZE,
                     static_cast<amf_int64>(4));
     SetOptionalProp(encoder_, AMF_VIDEO_ENCODER_AV1_QUERY_TIMEOUT,
                     static_cast<amf_int64>(50));
 
-    ApplyRateControlProperties();
+    ApplyRateControlProperties(true);
 
     res = encoder_->Init(amf::AMF_SURFACE_NV12, width, height);
     if (res != AMF_OK) return res;
@@ -746,11 +755,11 @@ int AmfAv1Encoder::SetTargetBitrate(int bitrate) {
     const bool at_bound =
         bitrate == min_supported || bitrate == impl_->config_.max_bitrate;
     if (!at_bound && applied > 0 &&
-        std::llabs(static_cast<int64_t>(bitrate) - applied) * 7 < applied) {
+        std::llabs(static_cast<int64_t>(bitrate) - applied) * 5 < applied) {
       return 0;
     }
     impl_->config_.init_bitrate = bitrate;
-    impl_->ApplyRateControlProperties();
+    impl_->ApplyRateControlProperties(false);
     return 0;
   });
 }
@@ -769,7 +778,7 @@ int AmfAv1Encoder::SetTargetFrameRate(int frame_rate) {
       impl_->encoder_->SetProperty(
           AMF_VIDEO_ENCODER_AV1_FRAMERATE,
           AMFConstructRate(static_cast<amf_uint32>(frame_rate), 1));
-      impl_->ApplyRateControlProperties();
+      impl_->ApplyRateControlProperties(false);
     }
     return 0;
   });
