@@ -267,6 +267,139 @@ inline void CacheSequenceHeaderFromBytes(
   }
 }
 
+class Av1SeqHeaderBitReader {
+ public:
+  Av1SeqHeaderBitReader(const uint8_t* data, size_t size)
+      : data_(data), bit_size_(size * 8) {}
+
+  bool ReadBits(int count, uint32_t& out) {
+    if (count < 0 || count > 32 ||
+        bit_pos_ + static_cast<size_t>(count) > bit_size_) {
+      return false;
+    }
+    uint32_t value = 0;
+    for (int i = 0; i < count; ++i) {
+      const size_t byte_index = bit_pos_ >> 3;
+      const int bit_offset = 7 - static_cast<int>(bit_pos_ & 7);
+      value = (value << 1) | ((data_[byte_index] >> bit_offset) & 1U);
+      ++bit_pos_;
+    }
+    out = value;
+    return true;
+  }
+
+  bool SkipBits(int count) {
+    if (count < 0 || bit_pos_ + static_cast<size_t>(count) > bit_size_) {
+      return false;
+    }
+    bit_pos_ += static_cast<size_t>(count);
+    return true;
+  }
+
+  bool SkipUvlc() {
+    int leading_zeros = 0;
+    while (true) {
+      uint32_t done = 0;
+      if (!ReadBits(1, done)) return false;
+      if (done) break;
+      ++leading_zeros;
+      if (leading_zeros >= 32) return false;
+    }
+    return leading_zeros == 0 || SkipBits(leading_zeros);
+  }
+
+ private:
+  const uint8_t* data_;
+  size_t bit_size_;
+  size_t bit_pos_ = 0;
+};
+
+inline bool ParseAv1SequenceHeaderDimensions(const uint8_t* obu_bytes,
+                                             size_t obu_size, int& out_w,
+                                             int& out_h) {
+  if (!obu_bytes || obu_size == 0) return false;
+  const uint8_t* payload = nullptr;
+  size_t payload_size = 0;
+  for (const auto& obu : ParseAv1Obus(obu_bytes, obu_size)) {
+    if (obu.type == kObuTypeSequenceHeader) {
+      payload = obu_bytes + obu.payload_offset;
+      payload_size = obu.payload_size;
+      break;
+    }
+  }
+  if (!payload || payload_size == 0) return false;
+
+  Av1SeqHeaderBitReader br(payload, payload_size);
+  uint32_t seq_profile = 0;
+  uint32_t still_picture = 0;
+  uint32_t reduced_still_picture_header = 0;
+  if (!br.ReadBits(3, seq_profile) || !br.ReadBits(1, still_picture) ||
+      !br.ReadBits(1, reduced_still_picture_header)) {
+    return false;
+  }
+  if (reduced_still_picture_header) {
+    if (!br.SkipBits(5)) return false;
+  } else {
+    uint32_t timing_info_present = 0;
+    uint32_t decoder_model_info_present = 0;
+    uint32_t buffer_delay_length_minus_1 = 0;
+    if (!br.ReadBits(1, timing_info_present)) return false;
+    if (timing_info_present) {
+      uint32_t equal_picture_interval = 0;
+      if (!br.SkipBits(64) || !br.ReadBits(1, equal_picture_interval)) {
+        return false;
+      }
+      if (equal_picture_interval && !br.SkipUvlc()) return false;
+      if (!br.ReadBits(1, decoder_model_info_present)) return false;
+      if (decoder_model_info_present) {
+        if (!br.ReadBits(5, buffer_delay_length_minus_1) || !br.SkipBits(42)) {
+          return false;
+        }
+      }
+    }
+    uint32_t initial_display_delay_present = 0;
+    uint32_t operating_points_cnt_minus_1 = 0;
+    if (!br.ReadBits(1, initial_display_delay_present) ||
+        !br.ReadBits(5, operating_points_cnt_minus_1)) {
+      return false;
+    }
+    for (uint32_t i = 0; i <= operating_points_cnt_minus_1; ++i) {
+      uint32_t level_idx = 0;
+      if (!br.SkipBits(12) || !br.ReadBits(5, level_idx)) return false;
+      if (level_idx > 7 && !br.SkipBits(1)) return false;
+      if (decoder_model_info_present) {
+        uint32_t dm_op = 0;
+        if (!br.ReadBits(1, dm_op)) return false;
+        if (dm_op &&
+            !br.SkipBits(2 * (static_cast<int>(buffer_delay_length_minus_1) + 1) +
+                         1)) {
+          return false;
+        }
+      }
+      if (initial_display_delay_present) {
+        uint32_t idd_op = 0;
+        if (!br.ReadBits(1, idd_op)) return false;
+        if (idd_op && !br.SkipBits(4)) return false;
+      }
+    }
+  }
+  uint32_t frame_width_bits_minus_1 = 0;
+  uint32_t frame_height_bits_minus_1 = 0;
+  uint32_t max_frame_width_minus_1 = 0;
+  uint32_t max_frame_height_minus_1 = 0;
+  if (!br.ReadBits(4, frame_width_bits_minus_1) ||
+      !br.ReadBits(4, frame_height_bits_minus_1) ||
+      !br.ReadBits(static_cast<int>(frame_width_bits_minus_1) + 1,
+                   max_frame_width_minus_1) ||
+      !br.ReadBits(static_cast<int>(frame_height_bits_minus_1) + 1,
+                   max_frame_height_minus_1)) {
+    return false;
+  }
+  out_w = static_cast<int>(max_frame_width_minus_1 + 1);
+  out_h = static_cast<int>(max_frame_height_minus_1 + 1);
+  return out_w > 0 && out_h > 0;
+}
+
 struct BitstreamProcessResult {
   bool valid = false;
   bool is_keyframe = false;
@@ -322,9 +455,18 @@ inline BitstreamProcessResult ProcessEncodedAv1Bitstream(
       after_seq_offset = insert_offset + sequence_header.size();
     }
   }
-  if (key && encode_mode == EncodeMode::kPad && source_width > 0 &&
-      source_height > 0 && source_width <= 65535 &&
-      source_height <= 65535) {
+  int coded_w = 0;
+  int coded_h = 0;
+  const bool coded_larger =
+      !sequence_header.empty() &&
+      ParseAv1SequenceHeaderDimensions(sequence_header.data(),
+                                       sequence_header.size(), coded_w,
+                                       coded_h) &&
+      (coded_w > source_width || coded_h > source_height);
+  const bool needs_crop = (encode_mode != EncodeMode::kScale) &&
+                          (encode_mode == EncodeMode::kPad || coded_larger);
+  if (key && needs_crop && source_width > 0 && source_height > 0 &&
+      source_width <= 65535 && source_height <= 65535) {
     av1_crop::AppendCropMetadataObu(bytes, after_seq_offset,
                                     static_cast<uint16_t>(source_width),
                                     static_cast<uint16_t>(source_height));

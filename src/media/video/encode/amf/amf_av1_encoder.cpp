@@ -74,13 +74,33 @@ AMF_RESULT LoadAmfFactory(HMODULE* out_dll, amf::AMFFactory** out_factory) {
 
 template <typename T>
 void SetOptionalProp(amf::AMFPropertyStorage* storage, const wchar_t* name,
-                     const T& value) {
+                     const char* label, const T& value) {
   if (!storage) return;
   const AMF_RESULT res = storage->SetProperty(name, value);
   if (res != AMF_OK) {
-    LOG_DEBUG("AMF AV1 optional property failed: res={}",
-              static_cast<int>(res));
+    LOG_WARN("AMD AMF AV1 property {} failed: res={}", label,
+             static_cast<int>(res));
   }
+}
+
+int64_t ReadPropInt64(amf::AMFPropertyStorage* storage, const wchar_t* name) {
+  if (!storage) return -1;
+  amf::AMFVariant var;
+  if (storage->GetProperty(name, &var) == AMF_OK &&
+      var.type == amf::AMF_VARIANT_INT64) {
+    return static_cast<int64_t>(var.int64Value);
+  }
+  return -1;
+}
+
+int ReadPropBool(amf::AMFPropertyStorage* storage, const wchar_t* name) {
+  if (!storage) return -1;
+  amf::AMFVariant var;
+  if (storage->GetProperty(name, &var) == AMF_OK &&
+      var.type == amf::AMF_VARIANT_BOOL) {
+    return var.boolValue ? 1 : 0;
+  }
+  return -1;
 }
 
 bool IsHardwareAccelerated(amf::AMFComponent* encoder) {
@@ -93,6 +113,37 @@ bool IsHardwareAccelerated(amf::AMFComponent* encoder) {
   return accel == amf::AMF_ACCEL_HARDWARE || accel == amf::AMF_ACCEL_GPU;
 }
 
+bool ProbeAmfAv1Support() {
+  HMODULE dll = nullptr;
+  amf::AMFFactory* factory = nullptr;
+  if (LoadAmfFactory(&dll, &factory) != AMF_OK) {
+    return false;
+  }
+  bool supported = false;
+  {
+    amf::AMFContextPtr context;
+    amf::AMFComponentPtr encoder;
+    if (factory->CreateContext(&context) == AMF_OK && context &&
+        context->InitDX11(nullptr, amf::AMF_DX11_0) == AMF_OK &&
+        factory->CreateComponent(context, AMFVideoEncoder_AV1, &encoder) ==
+            AMF_OK &&
+        encoder && IsHardwareAccelerated(encoder)) {
+      supported = true;
+    }
+    if (encoder) {
+      encoder->Terminate();
+      encoder = nullptr;
+    }
+    if (context) {
+      context->Terminate();
+      context = nullptr;
+    }
+  }
+  factory = nullptr;
+  FreeLibrary(dll);
+  return supported;
+}
+
 }  // namespace
 
 class AmfAv1Encoder::Impl {
@@ -103,12 +154,12 @@ class AmfAv1Encoder::Impl {
   ~Impl() {
     callback_worker_.Flush();
     worker_.Call([this] {
-      Reset();
+      Reset(true);
       fallback_.reset();
     });
   }
 
-  void Reset() {
+  void Reset(bool unload_dll = false) {
     if (encoder_) {
       encoder_->Terminate();
       encoder_ = nullptr;
@@ -117,10 +168,12 @@ class AmfAv1Encoder::Impl {
       context_->Terminate();
       context_ = nullptr;
     }
-    factory_ = nullptr;
-    if (amf_dll_) {
-      FreeLibrary(amf_dll_);
-      amf_dll_ = nullptr;
+    if (unload_dll) {
+      factory_ = nullptr;
+      if (amf_dll_) {
+        FreeLibrary(amf_dll_);
+        amf_dll_ = nullptr;
+      }
     }
     d3d_device_ = nullptr;
     d3d_tex_width_ = 0;
@@ -136,44 +189,54 @@ class AmfAv1Encoder::Impl {
     if (!encoder_) return;
     const amf_int64 fps = (std::max)(1, config_.max_frame_rate);
     const amf_int64 target_bps = (std::max)(10000, config_.init_bitrate);
-    const amf_int64 peak_bps = (std::max)(
-        target_bps,
-        (std::min)(static_cast<amf_int64>(config_.max_bitrate),
-                   target_bps + (target_bps / 2)));
-    // Cap per-frame compressed bursts (1.2 Mbit..3.6 Mbit == 150 KB..450 KB)
-    // to prevent desktop motion/IDR spikes from saturating UDP queues.
-    const amf_int64 raw_frame_cap = (peak_bps * 3) / fps;
-    const amf_int64 max_frame_bits =
-        (std::max)(static_cast<amf_int64>(1'200'000LL),
-                   (std::min)(static_cast<amf_int64>(3'600'000LL),
-                              raw_frame_cap));
-
-    SetOptionalProp(encoder_, AMF_VIDEO_ENCODER_AV1_TARGET_BITRATE, target_bps);
-    SetOptionalProp(encoder_, AMF_VIDEO_ENCODER_AV1_PEAK_BITRATE, peak_bps);
-    SetOptionalProp(encoder_, AMF_VIDEO_ENCODER_AV1_MAX_COMPRESSED_FRAME_SIZE,
-                    max_frame_bits);
+    // Align with Sunshine av1_amf: Peak == Target under vbr_latency and keep
+    // VBV sized to 1 frame (floor 200 Kbit) with HRD enforcement disabled.
+    SetOptionalProp(encoder_, AMF_VIDEO_ENCODER_AV1_TARGET_BITRATE,
+                    "TARGET_BITRATE", target_bps);
+    SetOptionalProp(encoder_, AMF_VIDEO_ENCODER_AV1_PEAK_BITRATE,
+                    "PEAK_BITRATE", target_bps);
 
     if (!initial_config) {
       return;
     }
 
-    // Keep VBV shallow (250ms at target bitrate, floor 2 Mbit) without rigid
-    // HRD enforcement so static-to-motion transitions recover without VCN stalls.
     const amf_int64 vbv_bits =
-        (std::max)(target_bps / 4, static_cast<amf_int64>(2'000'000LL));
-    SetOptionalProp(encoder_, AMF_VIDEO_ENCODER_AV1_VBV_BUFFER_SIZE, vbv_bits);
-    SetOptionalProp(encoder_, AMF_VIDEO_ENCODER_AV1_ENFORCE_HRD, false);
-    SetOptionalProp(encoder_, AMF_VIDEO_ENCODER_AV1_FILLER_DATA, false);
+        (std::max)(target_bps / fps, static_cast<amf_int64>(200'000LL));
+    SetOptionalProp(encoder_, AMF_VIDEO_ENCODER_AV1_VBV_BUFFER_SIZE,
+                    "VBV_BUFFER_SIZE", vbv_bits);
+    SetOptionalProp(encoder_, AMF_VIDEO_ENCODER_AV1_ENFORCE_HRD,
+                    "ENFORCE_HRD", false);
+    SetOptionalProp(encoder_, AMF_VIDEO_ENCODER_AV1_FILLER_DATA,
+                    "FILLER_DATA", false);
     SetOptionalProp(encoder_, AMF_VIDEO_ENCODER_AV1_RATE_CONTROL_SKIP_FRAME,
-                    false);
-    SetOptionalProp(encoder_, AMF_VIDEO_ENCODER_AV1_MIN_Q_INDEX_INTRA,
-                    static_cast<amf_int64>(20));
-    SetOptionalProp(encoder_, AMF_VIDEO_ENCODER_AV1_MIN_Q_INDEX_INTER,
-                    static_cast<amf_int64>(20));
-    SetOptionalProp(encoder_, AMF_VIDEO_ENCODER_AV1_MAX_Q_INDEX_INTRA,
-                    static_cast<amf_int64>(210));
-    SetOptionalProp(encoder_, AMF_VIDEO_ENCODER_AV1_MAX_Q_INDEX_INTER,
-                    static_cast<amf_int64>(210));
+                    "RATE_CONTROL_SKIP_FRAME", false);
+  }
+
+  void LogAppliedProperties(int coded_w, int coded_h) {
+    if (!encoder_) return;
+    int64_t width_align = -1;
+    int64_t height_align = -1;
+    amf::AMFCapsPtr caps;
+    if (encoder_->GetCaps(&caps) == AMF_OK && caps) {
+      width_align = ReadPropInt64(
+          caps, AMF_VIDEO_ENCODER_AV1_CAP_WIDTH_ALIGNMENT_FACTOR);
+      height_align = ReadPropInt64(
+          caps, AMF_VIDEO_ENCODER_AV1_CAP_HEIGHT_ALIGNMENT_FACTOR);
+    }
+    LOG_INFO(
+        "AMF AV1 readback ({}x{}): usage={} rc={} latency={} preset={} "
+        "align={} cap_align={}x{} target={} peak={} vbv={} hrd={} skip={}",
+        coded_w, coded_h, ReadPropInt64(encoder_, AMF_VIDEO_ENCODER_AV1_USAGE),
+        ReadPropInt64(encoder_, AMF_VIDEO_ENCODER_AV1_RATE_CONTROL_METHOD),
+        ReadPropInt64(encoder_, AMF_VIDEO_ENCODER_AV1_ENCODING_LATENCY_MODE),
+        ReadPropInt64(encoder_, AMF_VIDEO_ENCODER_AV1_QUALITY_PRESET),
+        ReadPropInt64(encoder_, AMF_VIDEO_ENCODER_AV1_ALIGNMENT_MODE),
+        width_align, height_align,
+        ReadPropInt64(encoder_, AMF_VIDEO_ENCODER_AV1_TARGET_BITRATE),
+        ReadPropInt64(encoder_, AMF_VIDEO_ENCODER_AV1_PEAK_BITRATE),
+        ReadPropInt64(encoder_, AMF_VIDEO_ENCODER_AV1_VBV_BUFFER_SIZE),
+        ReadPropBool(encoder_, AMF_VIDEO_ENCODER_AV1_ENFORCE_HRD),
+        ReadPropBool(encoder_, AMF_VIDEO_ENCODER_AV1_RATE_CONTROL_SKIP_FRAME));
   }
 
   AMF_RESULT Configure(int width, int height, ID3D11Device* d3d_device) {
@@ -203,55 +266,63 @@ class AmfAv1Encoder::Impl {
         AMF_VIDEO_ENCODER_AV1_USAGE,
         static_cast<amf_int64>(AMF_VIDEO_ENCODER_AV1_USAGE_ULTRA_LOW_LATENCY));
     if (res != AMF_OK) {
+      LOG_WARN("AMD AMF AV1 ULTRA_LOW_LATENCY failed (res={}), using "
+               "LOW_LATENCY",
+               static_cast<int>(res));
       SetOptionalProp(
-          encoder_, AMF_VIDEO_ENCODER_AV1_USAGE,
+          encoder_, AMF_VIDEO_ENCODER_AV1_USAGE, "USAGE",
           static_cast<amf_int64>(AMF_VIDEO_ENCODER_AV1_USAGE_LOW_LATENCY));
     }
 
     SetOptionalProp(
         encoder_, AMF_VIDEO_ENCODER_AV1_ENCODING_LATENCY_MODE,
+        "ENCODING_LATENCY_MODE",
         static_cast<amf_int64>(
             AMF_VIDEO_ENCODER_AV1_ENCODING_LATENCY_MODE_LOWEST_LATENCY));
     SetOptionalProp(
-        encoder_, AMF_VIDEO_ENCODER_AV1_QUALITY_PRESET,
+        encoder_, AMF_VIDEO_ENCODER_AV1_QUALITY_PRESET, "QUALITY_PRESET",
         static_cast<amf_int64>(AMF_VIDEO_ENCODER_AV1_QUALITY_PRESET_SPEED));
     SetOptionalProp(
-        encoder_, AMF_VIDEO_ENCODER_AV1_ALIGNMENT_MODE,
+        encoder_, AMF_VIDEO_ENCODER_AV1_ALIGNMENT_MODE, "ALIGNMENT_MODE",
         static_cast<amf_int64>(
             AMF_VIDEO_ENCODER_AV1_ALIGNMENT_MODE_NO_RESTRICTIONS));
     SetOptionalProp(
-        encoder_, AMF_VIDEO_ENCODER_AV1_PROFILE,
+        encoder_, AMF_VIDEO_ENCODER_AV1_PROFILE, "PROFILE",
         static_cast<amf_int64>(AMF_VIDEO_ENCODER_AV1_PROFILE_MAIN));
-    SetOptionalProp(encoder_, AMF_VIDEO_ENCODER_AV1_FRAMESIZE,
+    SetOptionalProp(encoder_, AMF_VIDEO_ENCODER_AV1_FRAMESIZE, "FRAMESIZE",
                     AMFConstructSize(width, height));
-    SetOptionalProp(encoder_, AMF_VIDEO_ENCODER_AV1_FRAMERATE,
+    SetOptionalProp(encoder_, AMF_VIDEO_ENCODER_AV1_FRAMERATE, "FRAMERATE",
                     AMFConstructRate(fps, 1));
     SetOptionalProp(
         encoder_, AMF_VIDEO_ENCODER_AV1_RATE_CONTROL_METHOD,
+        "RATE_CONTROL_METHOD",
         static_cast<amf_int64>(
             AMF_VIDEO_ENCODER_AV1_RATE_CONTROL_METHOD_LATENCY_CONSTRAINED_VBR));
-    SetOptionalProp(encoder_, AMF_VIDEO_ENCODER_AV1_PRE_ANALYSIS_ENABLE, false);
+    SetOptionalProp(encoder_, AMF_VIDEO_ENCODER_AV1_PRE_ANALYSIS_ENABLE,
+                    "PRE_ANALYSIS_ENABLE", false);
     SetOptionalProp(encoder_, AMF_VIDEO_ENCODER_AV1_RATE_CONTROL_PREENCODE,
-                    false);
+                    "RATE_CONTROL_PREENCODE", false);
     SetOptionalProp(encoder_, AMF_VIDEO_ENCODER_AV1_MAX_CONSECUTIVE_BPICTURES,
-                    static_cast<amf_int64>(0));
+                    "MAX_CONSECUTIVE_BPICTURES", static_cast<amf_int64>(0));
     SetOptionalProp(encoder_, AMF_VIDEO_ENCODER_AV1_MAX_NUM_REFRAMES,
-                    static_cast<amf_int64>(1));
-    SetOptionalProp(encoder_, AMF_VIDEO_ENCODER_AV1_GOP_SIZE,
+                    "MAX_NUM_REFRAMES", static_cast<amf_int64>(1));
+    SetOptionalProp(encoder_, AMF_VIDEO_ENCODER_AV1_GOP_SIZE, "GOP_SIZE",
                     static_cast<amf_int64>(config_.key_frame_interval));
     SetOptionalProp(
         encoder_, AMF_VIDEO_ENCODER_AV1_HEADER_INSERTION_MODE,
+        "HEADER_INSERTION_MODE",
         static_cast<amf_int64>(
             AMF_VIDEO_ENCODER_AV1_HEADER_INSERTION_MODE_KEY_FRAME_ALIGNED));
     SetOptionalProp(encoder_, AMF_VIDEO_ENCODER_AV1_SCREEN_CONTENT_TOOLS,
-                    true);
-    SetOptionalProp(encoder_, AMF_VIDEO_ENCODER_AV1_PALETTE_MODE, true);
+                    "SCREEN_CONTENT_TOOLS", true);
+    SetOptionalProp(encoder_, AMF_VIDEO_ENCODER_AV1_PALETTE_MODE,
+                    "PALETTE_MODE", true);
     SetOptionalProp(encoder_, AMF_VIDEO_ENCODER_AV1_TILES_PER_FRAME,
-                    static_cast<amf_int64>(4));
+                    "TILES_PER_FRAME", static_cast<amf_int64>(4));
     SetOptionalProp(encoder_, AMF_VIDEO_ENCODER_AV1_INPUT_QUEUE_SIZE,
-                    static_cast<amf_int64>(4));
+                    "INPUT_QUEUE_SIZE", static_cast<amf_int64>(4));
     SetOptionalProp(encoder_, AMF_VIDEO_ENCODER_AV1_QUERY_TIMEOUT,
-                    static_cast<amf_int64>(50));
+                    "QUERY_TIMEOUT", static_cast<amf_int64>(50));
 
     ApplyRateControlProperties(true);
 
@@ -259,6 +330,7 @@ class AmfAv1Encoder::Impl {
     if (res != AMF_OK) return res;
 
     CacheSequenceHeaderFromExtraData(sequence_header_);
+    LogAppliedProperties(width, height);
     return AMF_OK;
   }
 
@@ -509,10 +581,11 @@ class AmfAv1Encoder::Impl {
     }
     if (force_idr_) {
       SetOptionalProp(
-          surface, AMF_VIDEO_ENCODER_AV1_FORCE_FRAME_TYPE,
+          surface, AMF_VIDEO_ENCODER_AV1_FORCE_FRAME_TYPE, "FORCE_FRAME_TYPE",
           static_cast<amf_int64>(AMF_VIDEO_ENCODER_AV1_FORCE_FRAME_TYPE_KEY));
       SetOptionalProp(surface,
-                      AMF_VIDEO_ENCODER_AV1_FORCE_INSERT_SEQUENCE_HEADER, true);
+                      AMF_VIDEO_ENCODER_AV1_FORCE_INSERT_SEQUENCE_HEADER,
+                      "FORCE_INSERT_SEQUENCE_HEADER", true);
     }
 
     const auto deadline =
@@ -526,11 +599,11 @@ class AmfAv1Encoder::Impl {
         submit_ms +=
             std::chrono::duration<double, std::milli>(sub_end - sub_start)
                 .count();
-        if (res == AMF_OK) {
+        if (res == AMF_OK || res == AMF_NEED_MORE_INPUT) {
           submitted = true;
           encode_submitted = sub_end;
           surface = nullptr;
-        } else if (res != AMF_INPUT_FULL && res != AMF_NEED_MORE_INPUT) {
+        } else if (res != AMF_INPUT_FULL) {
           return res;
         }
       }
@@ -550,23 +623,26 @@ class AmfAv1Encoder::Impl {
         res = ReadOutputBuffer(out_buf, raw, frames);
         if (res != AMF_OK) return res;
         ++sequence_;
-        const auto encode_end = std::chrono::steady_clock::now();
-        const double total_ms =
-            std::chrono::duration<double, std::milli>(encode_end - encode_start)
-                .count();
-        const double hw_ms =
-            submitted ? std::chrono::duration<double, std::milli>(
-                            encode_end - encode_submitted)
-                            .count()
-                      : 0.0;
-        const size_t encoded_bytes = frames.empty() ? 0 : frames.back().Size();
-        const bool is_key =
-            !frames.empty() &&
-            frames.back().FrameType() == VideoFrameType::kVideoFrameKey;
-        stats_.Record("AMF AV1", encode_end, encode_width_, encode_height_,
-                      using_d3d11_, total_ms, wait_poll_ms, submit_ms, hw_ms,
-                      encoded_bytes, is_key);
-        return AMF_OK;
+        if (submitted) {
+          const auto encode_end = std::chrono::steady_clock::now();
+          const double total_ms =
+              std::chrono::duration<double, std::milli>(encode_end -
+                                                        encode_start)
+                  .count();
+          const double hw_ms =
+              std::chrono::duration<double, std::milli>(encode_end -
+                                                        encode_submitted)
+                  .count();
+          const size_t encoded_bytes =
+              frames.empty() ? 0 : frames.back().Size();
+          const bool is_key =
+              !frames.empty() &&
+              frames.back().FrameType() == VideoFrameType::kVideoFrameKey;
+          stats_.Record("AMF AV1", encode_end, encode_width_, encode_height_,
+                        using_d3d11_, total_ms, wait_poll_ms, submit_ms, hw_ms,
+                        encoded_bytes, is_key);
+          return AMF_OK;
+        }
       }
       if (res != AMF_REPEAT && res != AMF_OK) {
         return res;
@@ -615,33 +691,7 @@ AmfAv1Encoder::AmfAv1Encoder(std::shared_ptr<SystemClock> clock)
 AmfAv1Encoder::~AmfAv1Encoder() = default;
 
 bool AmfAv1Encoder::IsSupported() {
-  HMODULE dll = nullptr;
-  amf::AMFFactory* factory = nullptr;
-  if (LoadAmfFactory(&dll, &factory) != AMF_OK) {
-    return false;
-  }
-  bool supported = false;
-  {
-    amf::AMFContextPtr context;
-    amf::AMFComponentPtr encoder;
-    if (factory->CreateContext(&context) == AMF_OK && context &&
-        context->InitDX11(nullptr, amf::AMF_DX11_0) == AMF_OK &&
-        factory->CreateComponent(context, AMFVideoEncoder_AV1, &encoder) ==
-            AMF_OK &&
-        encoder && IsHardwareAccelerated(encoder)) {
-      supported = true;
-    }
-    if (encoder) {
-      encoder->Terminate();
-      encoder = nullptr;
-    }
-    if (context) {
-      context->Terminate();
-      context = nullptr;
-    }
-  }
-  factory = nullptr;
-  FreeLibrary(dll);
+  static const bool supported = ProbeAmfAv1Support();
   return supported;
 }
 
@@ -690,7 +740,7 @@ int AmfAv1Encoder::Encode(const RawFrame& raw,
           "AMD AMF hardware AV1 encoding failed ({}); falling back to WMF/"
           "SVT-AV1",
           static_cast<int>(res));
-      impl_->Reset();
+      impl_->Reset(true);
       if (WmfAv1Encoder::IsSupported()) {
         auto wmf = std::make_unique<WmfAv1Encoder>(impl_->clock_);
         if (wmf->Init(impl_->config_) == 0) {
