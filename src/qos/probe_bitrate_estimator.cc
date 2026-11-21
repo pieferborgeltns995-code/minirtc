@@ -165,7 +165,9 @@ std::optional<DataRate> ProbeBitrateEstimator::HandleProbeAndEstimateBitrate(
   // If we're receiving at significantly lower bitrate than we were sending at,
   // it suggests that we've found the true capacity of the link. In this case,
   // set the target bitrate slightly lower to not immediately overuse.
-  if (receive_rate < kMinRatioForUnsaturatedLink * send_rate) {
+  const bool saturated =
+      receive_rate < kMinRatioForUnsaturatedLink * send_rate;
+  if (saturated) {
     res = kTargetUtilizationFraction * receive_rate;
   }
 
@@ -175,16 +177,21 @@ std::optional<DataRate> ProbeBitrateEstimator::HandleProbeAndEstimateBitrate(
   if (cluster_id >= estimated_cluster_id_) {
     estimated_data_rate_ = res;
     estimated_cluster_id_ = cluster_id;
+    estimated_saturated_ = saturated;
   }
   return res;
 }
 
 std::optional<DataRate>
-ProbeBitrateEstimator::FetchAndResetLastEstimatedBitrate(int* cluster_id) {
+ProbeBitrateEstimator::FetchAndResetLastEstimatedBitrate(int* cluster_id,
+                                                         bool* saturated) {
   if (cluster_id)
     *cluster_id = estimated_data_rate_ ? estimated_cluster_id_ : -1;
+  if (saturated)
+    *saturated = estimated_data_rate_ ? estimated_saturated_ : false;
   std::optional<DataRate> estimated_data_rate = estimated_data_rate_;
   estimated_data_rate_.reset();
+  estimated_saturated_ = false;
   return estimated_data_rate;
 }
 

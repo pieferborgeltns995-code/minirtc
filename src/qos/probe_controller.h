@@ -154,6 +154,10 @@ class ProbeController {
   void SetAlrEndedTimeMs(int64_t alr_end_time);
 
   std::vector<ProbeClusterConfig> RequestProbe(Timestamp at_time);
+  // Probe once when leaving a sustained ALR period (e.g. a static desktop
+  // resuming motion) so link capacity is confirmed or recovered promptly.
+  std::vector<ProbeClusterConfig> RequestAlrExitProbe(Timestamp at_time,
+                                                      DataRate reference_rate);
 
   void SetNetworkStateEstimate(webrtc::NetworkStateEstimate estimate);
 
@@ -214,6 +218,7 @@ class ProbeController {
   State state_;
   DataRate min_bitrate_to_probe_further_ = DataRate::PlusInfinity();
   Timestamp time_last_probing_initiated_ = Timestamp::MinusInfinity();
+  Timestamp last_alr_exit_probe_time_ = Timestamp::MinusInfinity();
   DataRate estimated_bitrate_ = DataRate::Zero();
   std::optional<webrtc::NetworkStateEstimate> network_estimate_;
   DataRate start_bitrate_ = DataRate::Zero();

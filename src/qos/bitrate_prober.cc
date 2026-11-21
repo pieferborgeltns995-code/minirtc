@@ -113,13 +113,18 @@ void BitrateProber::OnIncomingPacket(DataSize packet_size) {
 void BitrateProber::CreateProbeCluster(
     const ProbeClusterConfig& cluster_config) {
   RemoveExpiredClusters(cluster_config.at_time);
+  // An earlier request that has not sent a single packet (typical while an
+  // idle desktop has no media packets) is superseded by a newer probe batch;
+  // clusters from the same InitiateProbing() call share at_time and stay.
   while (!clusters_.empty() &&
-         clusters_.size() >= kMaxPendingProbeClusters) {
+         ((clusters_.front().sent_probes == 0 &&
+           clusters_.front().requested_at < cluster_config.at_time) ||
+          clusters_.size() >= kMaxPendingProbeClusters)) {
     const ProbeCluster& cluster = clusters_.front();
-    LOG_WARN(
-        "Probe cluster discarded: id={} reason=pending_queue_limit "
-        "actual_bytes={} "
-        "actual_packets={} target_bytes={} target_probe_batches={}",
+    LOG_DEBUG(
+        "Probe cluster discarded: id={} reason=superseded_or_queue_limit "
+        "actual_bytes={} actual_packets={} target_bytes={} "
+        "target_probe_batches={}",
         cluster.pace_info.probe_cluster_id, cluster.sent_bytes,
         cluster.sent_packets, cluster.pace_info.probe_cluster_min_bytes,
         cluster.pace_info.probe_cluster_min_probes);

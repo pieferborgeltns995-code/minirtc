@@ -37,20 +37,39 @@ constexpr TimeDelta kProbeEstimateSettleTime = TimeDelta::Millis(100);
 // after motion resumes keeps it for a grace window so the first large frames
 // drain at the pre-idle rate while fresh feedback confirms or refutes it.
 constexpr TimeDelta kIdleHoldResumeGrace = TimeDelta::Seconds(3);
+// Minimum continuous ALR dwell before exit arms the resume grace window or
+// triggers an ALR-exit probe, preventing brief interactive dips from
+// refreshing the hold indefinitely.
+constexpr TimeDelta kIdleHoldMinAlrDwell = TimeDelta::Seconds(1);
+// After leaving ALR, keep the floor at least this long to absorb the first
+// scene-change frames; once acked throughput recovers past half the held
+// rate without overuse, end the grace window early so GCC resumes normal
+// two-way adaptation.
+constexpr TimeDelta kIdleHoldMinGrace = TimeDelta::Millis(500);
+constexpr double kIdleHoldGraceEndAckedRatio = 0.50;
 // Below this there is nothing worth protecting.
 constexpr DataRate kIdleHoldMinRate = DataRate::BitsPerSec(1000000);
 // Only confirmed congestion lowers the held rate. Like RustDesk's TestDelay,
 // queueing delay above the path baseline counts, and one bad sample is
 // jitter: kIdleHoldBadRttSamples consecutive fresh feedback RTTs must exceed
-// the baseline, the first at least kIdleHoldCongestionConfirm ago. The
-// trendline overuse state is deliberately not used: sparse idle traffic
-// trips it without any queue. Loss above 10% (the level at which
-// SendSideBandwidthEstimation itself decreases) in two consecutive windows
-// of at least kIdleHoldCongestionConfirm and kIdleHoldMinLossPackets also
-// counts.
+// the baseline, the first at least kIdleHoldCongestionConfirm ago. Sparse
+// idle traffic trips the trendline overuse detector without any real queue,
+// so delay overuse only counts when acknowledged throughput is non-idle
+// (>= max(kIdleHoldMinRate, kIdleHoldLoadedAckedRatio * held)) and persists
+// across fresh feedback for kIdleHoldCongestionConfirm. Loss above 10% (the
+// level at which SendSideBandwidthEstimation itself decreases) in two
+// consecutive windows of at least kIdleHoldCongestionConfirm and
+// kIdleHoldMinLossPackets also counts.
 constexpr TimeDelta kIdleHoldRttExcess = TimeDelta::Millis(150);
 constexpr double kIdleHoldRttRatio = 2.0;
+// Under non-idle throughput, a shallow bottleneck buffer may cap out below
+// 150 ms and flatten the trendline slope into a standing queue; count both
+// active delay growth and a moderate standing queue as loaded overuse.
+constexpr TimeDelta kIdleHoldLoadedRttExcess = TimeDelta::Millis(75);
+constexpr double kIdleHoldLoadedRttRatio = 1.5;
 constexpr int kIdleHoldBadRttSamples = 3;
+constexpr int kIdleHoldBadOveruseSamples = 3;
+constexpr double kIdleHoldLoadedAckedRatio = 0.35;
 constexpr TimeDelta kIdleHoldCongestionConfirm = TimeDelta::Millis(500);
 constexpr double kIdleHoldLossRatio = 0.10;
 constexpr int64_t kIdleHoldMinLossPackets = 20;
@@ -63,9 +82,8 @@ constexpr TimeDelta kIdleHoldBackoffInterval = TimeDelta::Seconds(3);
 // sample never becomes the baseline.
 constexpr TimeDelta kIdleHoldRttBucket = TimeDelta::Seconds(10);
 // Feedback arrives every ~25-50 ms under load; a longer gap ends a high-RTT
-// streak, and a streak older than this cannot confirm congestion.
+// or overuse streak, and a streak older than this cannot confirm congestion.
 constexpr TimeDelta kIdleHoldRttSampleGap = TimeDelta::Millis(250);
-
 double IdleHoldBackoffFactor(TimeDelta rtt_excess, double loss_ratio) {
   double factor = 1.0;
   if (rtt_excess >= kIdleHoldRttExcess) {
@@ -165,6 +183,19 @@ void CongestionControl::SetRepeatedInitialProbing(bool enable) {
   probe_controller_->EnableRepeatedInitialProbing(enable);
 }
 
+NetworkControlUpdate CongestionControl::SetMaxTotalAllocatedBitrate(
+    DataRate max_total_allocated_bitrate, Timestamp at_time) {
+  NetworkControlUpdate update;
+  if (initial_config_) {
+    initial_config_->stream_based_config.max_total_allocated_bitrate =
+        max_total_allocated_bitrate;
+    return update;
+  }
+  update.probe_cluster_configs = probe_controller_->OnMaxTotalAllocatedBitrate(
+      max_total_allocated_bitrate, at_time);
+  return update;
+}
+
 void CongestionControl::SetIdleRateHold(bool enabled) {
   idle_rate_hold_enabled_ = enabled;
   if (!enabled) ResetIdleRateHold();
@@ -174,6 +205,8 @@ void CongestionControl::ResetIdleRateHold() {
   idle_hold_rate_ = DataRate::Zero();
   idle_hold_learned_ = false;
   idle_hold_until_ = Timestamp::MinusInfinity();
+  idle_hold_grace_start_ = Timestamp::MinusInfinity();
+  idle_hold_alr_since_ = Timestamp::PlusInfinity();
   idle_hold_in_alr_ = false;
   idle_hold_rtt_min_current_ = TimeDelta::PlusInfinity();
   idle_hold_rtt_min_previous_ = TimeDelta::PlusInfinity();
@@ -182,6 +215,10 @@ void CongestionControl::ResetIdleRateHold() {
   idle_hold_bad_rtt_since_ = Timestamp::PlusInfinity();
   idle_hold_bad_rtt_last_ = Timestamp::MinusInfinity();
   idle_hold_last_rtt_sample_ = Timestamp::MinusInfinity();
+  idle_hold_bad_overuse_samples_ = 0;
+  idle_hold_bad_overuse_since_ = Timestamp::PlusInfinity();
+  idle_hold_bad_overuse_last_ = Timestamp::MinusInfinity();
+  idle_hold_last_overuse_sample_ = Timestamp::MinusInfinity();
   idle_hold_loss_window_start_ = Timestamp::MinusInfinity();
   idle_hold_loss_packets_ = 0;
   idle_hold_lost_packets_ = 0;
@@ -191,11 +228,9 @@ void CongestionControl::ResetIdleRateHold() {
 }
 
 void CongestionControl::UpdateIdleHoldFeedback(TimeDelta rtt, int64_t packets,
-                                               int64_t lost, bool in_alr,
-                                               bool delay_updated,
+                                               int64_t lost,
                                                Timestamp at_time) {
   if (!idle_rate_hold_enabled_) return;
-  if (!in_alr && delay_updated) idle_hold_learned_ = true;
   if (rtt.IsFinite() && rtt > TimeDelta::Zero()) {
     if (at_time - idle_hold_rtt_bucket_start_ >= kIdleHoldRttBucket) {
       idle_hold_rtt_min_previous_ = idle_hold_rtt_min_current_;
@@ -240,6 +275,58 @@ void CongestionControl::UpdateIdleHoldFeedback(TimeDelta rtt, int64_t packets,
   }
 }
 
+void CongestionControl::UpdateIdleHoldDelayState(BandwidthUsage delay_state,
+                                                 bool in_alr,
+                                                 bool delay_updated,
+                                                 Timestamp at_time) {
+  if (!idle_rate_hold_enabled_) return;
+  if (!in_alr && delay_updated) idle_hold_learned_ = true;
+  // Count active delay growth (kBwOverusing) or a moderate standing queue once
+  // a shallow buffer has filled; confirmation below requires acknowledged
+  // throughput to be non-idle so sparse static traffic cannot trigger it.
+  const TimeDelta baseline =
+      std::min(idle_hold_rtt_min_current_, idle_hold_rtt_min_previous_);
+  const TimeDelta rtt = bandwidth_estimation_->round_trip_time();
+  const bool standing_queue =
+      baseline.IsFinite() && rtt.IsFinite() &&
+      rtt - baseline >= kIdleHoldLoadedRttExcess &&
+      rtt >= baseline * kIdleHoldLoadedRttRatio;
+  const bool delay_overloaded =
+      delay_state == BandwidthUsage::kBwOverusing || standing_queue;
+  if (!delay_overloaded ||
+      at_time - idle_hold_last_overuse_sample_ > kIdleHoldRttSampleGap) {
+    idle_hold_bad_overuse_samples_ = 0;
+    idle_hold_bad_overuse_since_ = Timestamp::PlusInfinity();
+  }
+  if (delay_overloaded) {
+    if (idle_hold_bad_overuse_samples_++ == 0) {
+      idle_hold_bad_overuse_since_ = at_time;
+    }
+    idle_hold_bad_overuse_last_ = at_time;
+  }
+  idle_hold_last_overuse_sample_ = at_time;
+}
+
+void CongestionControl::OnIdleHoldSaturatedProbe(DataRate bitrate,
+                                                 Timestamp at_time) {
+  if (!idle_rate_hold_enabled_) return;
+  const auto floor = IdleHoldFloor(at_time);
+  if (!floor || bitrate >= *floor) return;
+  const DataRate lowered = std::max(bitrate, min_data_rate_);
+  LOG_INFO(
+      "Idle rate hold lowered by saturated probe: held_bps={} new_bps={} "
+      "in_alr={}",
+      idle_hold_rate_.bps(), lowered.bps(), idle_hold_in_alr_);
+  idle_hold_rate_ = lowered;
+  if (!idle_hold_in_alr_) {
+    // Fresh probe capacity under load supersedes the post-idle grace window.
+    idle_hold_until_ = Timestamp::MinusInfinity();
+  }
+  delay_based_bwe_->SetEstimate(lowered, at_time);
+  bandwidth_estimation_->SetSendBitrate(lowered, at_time);
+  bandwidth_estimation_->UpdateDelayBasedEstimate(at_time, lowered);
+}
+
 std::optional<DataRate> CongestionControl::IdleHoldFloor(
     Timestamp at_time) const {
   if (!idle_rate_hold_enabled_ || !idle_hold_learned_ ||
@@ -258,6 +345,10 @@ void CongestionControl::UpdateIdleRateHold(bool in_alr, Timestamp at_time) {
   const TimeDelta baseline =
       std::min(idle_hold_rtt_min_current_, idle_hold_rtt_min_previous_);
   const TimeDelta rtt = bandwidth_estimation_->round_trip_time();
+  const std::optional<DataRate> acked =
+      acknowledged_bitrate_estimator_->bitrate();
+  const DataRate loaded_threshold =
+      std::max(kIdleHoldMinRate, idle_hold_rate_ * kIdleHoldLoadedAckedRatio);
   // Persistence is measured between the first and the latest bad sample, so
   // it takes fresh feedback, not elapsed process ticks, to confirm.
   const bool rtt_confirmed =
@@ -265,6 +356,12 @@ void CongestionControl::UpdateIdleRateHold(bool in_alr, Timestamp at_time) {
       idle_hold_bad_rtt_last_ - idle_hold_bad_rtt_since_ >=
           kIdleHoldCongestionConfirm &&
       at_time - idle_hold_bad_rtt_last_ <= kIdleHoldRttSampleGap;
+  const bool overuse_confirmed =
+      acked.has_value() && *acked >= loaded_threshold &&
+      idle_hold_bad_overuse_samples_ >= kIdleHoldBadOveruseSamples &&
+      idle_hold_bad_overuse_last_ - idle_hold_bad_overuse_since_ >=
+          kIdleHoldCongestionConfirm &&
+      at_time - idle_hold_bad_overuse_last_ <= kIdleHoldRttSampleGap;
   const bool loss_confirmed =
       idle_hold_bad_loss_windows_ >= kIdleHoldBadLossWindows;
   const bool held = IdleHoldFloor(at_time).has_value();
@@ -272,83 +369,123 @@ void CongestionControl::UpdateIdleRateHold(bool in_alr, Timestamp at_time) {
   // like RustDesk's ratio cooldown.
   const bool may_act =
       !in_alr || at_time - idle_hold_last_backoff_ >= kIdleHoldBackoffInterval;
-
-  if (held && may_act && (rtt_confirmed || loss_confirmed)) {
+  if (held && may_act &&
+      (rtt_confirmed || overuse_confirmed || loss_confirmed)) {
     const TimeDelta excess = baseline.IsFinite() && rtt.IsFinite()
                                  ? rtt - baseline
                                  : TimeDelta::Zero();
     DataRate lowered = DataRate::Zero();
     if (!in_alr) {
-      // Congestion under load. The estimators may still sit at the floor the
-      // hold wrote into them, so push them to what the link delivered (like
-      // AIMD's overuse decrease) and re-learn only from a fresh delay-based
-      // update; otherwise the release could re-learn the rate it released.
-      const std::optional<DataRate> acked =
-          acknowledged_bitrate_estimator_->bitrate();
-      lowered = acked ? std::min(target, *acked * kProbeDropThroughputFraction)
-                      : target;
-      LOG_INFO(
-          "Idle rate hold released by congestion: held_bps={} new_bps={} "
-          "rtt_ms={} rtt_baseline_ms={} loss_window={:.3f}",
-          idle_hold_rate_.bps(), lowered.bps(),
-          rtt.IsFinite() ? rtt.ms() : -1,
-          baseline.IsFinite() ? baseline.ms() : -1, idle_hold_loss_ratio_);
-      idle_hold_rate_ = DataRate::Zero();
-      idle_hold_learned_ = false;
-      idle_hold_until_ = Timestamp::MinusInfinity();
+      if ((rtt_confirmed || overuse_confirmed) && acked.has_value()) {
+        lowered = std::min(target, *acked * kProbeDropThroughputFraction);
+      } else if (loss_confirmed) {
+        lowered = std::min(
+            target, idle_hold_rate_ *
+                        IdleHoldBackoffFactor(TimeDelta::Zero(),
+                                              idle_hold_loss_ratio_));
+      } else {
+        lowered = target;
+      }
     } else {
-      // Congestion while idle (another flow on the link): lower the held
-      // rate by RustDesk's confirmed step instead of collapsing to the idle
-      // throughput. `target` is the restored floor here, so it is no bound.
       const double factor = std::min(
           0.95, IdleHoldBackoffFactor(
-                    excess, loss_confirmed ? idle_hold_loss_ratio_ : 0.0));
+                    rtt_confirmed ? excess : TimeDelta::Zero(),
+                    loss_confirmed ? idle_hold_loss_ratio_ : 0.0));
       lowered = idle_hold_rate_ * factor;
-      LOG_INFO(
-          "Idle rate hold lowered by congestion: held_bps={} new_bps={} "
-          "rtt_ms={} rtt_baseline_ms={} loss_window={:.3f}",
-          idle_hold_rate_.bps(), lowered.bps(), rtt.IsFinite() ? rtt.ms() : -1,
-          baseline.IsFinite() ? baseline.ms() : -1, idle_hold_loss_ratio_);
-      idle_hold_rate_ = lowered;
+      if (overuse_confirmed && acked.has_value()) {
+        lowered = std::min(lowered, *acked * kProbeDropThroughputFraction);
+      }
     }
-    idle_hold_last_backoff_ = at_time;
-    idle_hold_bad_rtt_samples_ = 0;
-    idle_hold_bad_rtt_since_ = Timestamp::PlusInfinity();
-    idle_hold_bad_loss_windows_ = 0;
-    idle_hold_in_alr_ = in_alr;
-    // The estimators may hold the restored floor; lower them with the hold.
-    lowered = std::max(lowered, min_data_rate_);
-    if (lowered < target) {
-      delay_based_bwe_->SetEstimate(lowered, at_time);
-      bandwidth_estimation_->SetSendBitrate(lowered, at_time);
-      bandwidth_estimation_->UpdateDelayBasedEstimate(at_time, lowered);
+    // Only act when congestion actually calls for a rate below the held floor;
+    // if the estimate has already climbed above the floor (e.g. an exponential
+    // probe testing the upper link ceiling), the hold is not in the way.
+    if (lowered < idle_hold_rate_) {
+      if (!in_alr) {
+        LOG_INFO(
+            "Idle rate hold released by congestion: held_bps={} new_bps={} "
+            "rtt_ms={} rtt_baseline_ms={} loss_window={:.3f} overuse={}",
+            idle_hold_rate_.bps(), lowered.bps(),
+            rtt.IsFinite() ? rtt.ms() : -1,
+            baseline.IsFinite() ? baseline.ms() : -1, idle_hold_loss_ratio_,
+            overuse_confirmed);
+        idle_hold_rate_ = DataRate::Zero();
+        idle_hold_learned_ = false;
+        idle_hold_until_ = Timestamp::MinusInfinity();
+        idle_hold_grace_start_ = Timestamp::MinusInfinity();
+        idle_hold_alr_since_ = Timestamp::PlusInfinity();
+      } else {
+        LOG_INFO(
+            "Idle rate hold lowered by congestion: held_bps={} new_bps={} "
+            "rtt_ms={} rtt_baseline_ms={} loss_window={:.3f} overuse={}",
+            idle_hold_rate_.bps(), lowered.bps(),
+            rtt.IsFinite() ? rtt.ms() : -1,
+            baseline.IsFinite() ? baseline.ms() : -1, idle_hold_loss_ratio_,
+            overuse_confirmed);
+        idle_hold_rate_ = lowered;
+      }
+      idle_hold_last_backoff_ = at_time;
+      idle_hold_bad_rtt_samples_ = 0;
+      idle_hold_bad_rtt_since_ = Timestamp::PlusInfinity();
+      idle_hold_bad_overuse_samples_ = 0;
+      idle_hold_bad_overuse_since_ = Timestamp::PlusInfinity();
+      idle_hold_bad_loss_windows_ = 0;
+      idle_hold_in_alr_ = in_alr;
+      lowered = std::max(lowered, min_data_rate_);
+      if (lowered < target) {
+        delay_based_bwe_->SetEstimate(lowered, at_time);
+        bandwidth_estimation_->SetSendBitrate(lowered, at_time);
+        bandwidth_estimation_->UpdateDelayBasedEstimate(at_time, lowered);
+      }
+      return;
     }
-    return;
   }
 
   if (!idle_hold_learned_) {
     // Nothing measured under load yet (session start, after a reset or a
     // release): do not arm at a configured start rate.
+    if (in_alr && !idle_hold_in_alr_) {
+      idle_hold_alr_since_ = at_time;
+    } else if (!in_alr) {
+      idle_hold_alr_since_ = Timestamp::PlusInfinity();
+    }
     idle_hold_in_alr_ = in_alr;
     return;
   }
   if (!in_alr) {
     if (idle_hold_in_alr_) {
-      // Motion resumed: keep the held floor for a grace window.
-      idle_hold_until_ = at_time + kIdleHoldResumeGrace;
-      LOG_DEBUG("Idle rate hold: motion resumed held_bps={} target_bps={}",
-                idle_hold_rate_.bps(), target.bps());
+      // Only arm the resume grace window after a sustained idle dwell so
+      // brief dips into ALR during interactive use cannot refresh it forever.
+      if (idle_hold_alr_since_.IsFinite() &&
+          at_time - idle_hold_alr_since_ >= kIdleHoldMinAlrDwell) {
+        idle_hold_grace_start_ = at_time;
+        idle_hold_until_ = at_time + kIdleHoldResumeGrace;
+        LOG_DEBUG("Idle rate hold: motion resumed held_bps={} target_bps={}",
+                  idle_hold_rate_.bps(), target.bps());
+      }
+      idle_hold_alr_since_ = Timestamp::PlusInfinity();
+    }
+    // End the grace window early once initial scene-change frames have passed
+    // and acked throughput confirms the estimators are back on loaded data.
+    const std::optional<DataRate> acked =
+        acknowledged_bitrate_estimator_->bitrate();
+    if (at_time <= idle_hold_until_ &&
+        at_time - idle_hold_grace_start_ >= kIdleHoldMinGrace &&
+        delay_based_bwe_->last_state() != BandwidthUsage::kBwOverusing &&
+        acked.has_value() &&
+        *acked >= idle_hold_rate_ * kIdleHoldGraceEndAckedRatio) {
+      idle_hold_until_ = Timestamp::MinusInfinity();
+      LOG_DEBUG("Idle rate hold: grace ended early acked_bps={} target_bps={}",
+                acked->bps(), target.bps());
     }
     if (at_time > idle_hold_until_) {
       // Loaded link, no hold active: the estimators are authoritative.
       idle_hold_rate_ = target;
-    } else {
-      // Grace window: a lower target is the stale idle estimate; a higher
-      // one (probe, increase) is new information.
-      idle_hold_rate_ = std::max(idle_hold_rate_, target);
     }
+    // During the grace window keep idle_hold_rate_ frozen (do not ratchet it
+    // upward while decreases are suppressed).
   } else {
     if (!idle_hold_in_alr_) {
+      idle_hold_alr_since_ = at_time;
       LOG_DEBUG("Idle rate hold: entering idle held_bps={} target_bps={}",
                 std::max(idle_hold_rate_, target).bps(), target.bps());
     }
@@ -395,6 +532,7 @@ NetworkControlUpdate CongestionControl::SetRelayPath(bool relay_path,
   probe_controller_->SetRelayPath(relay_path);
   // A new path invalidates the held rate and the RTT baseline. A relay move
   // deliberately lowers the target, which the hold must not undo.
+  last_alr_start_time_.reset();
   ResetIdleRateHold();
   const DataRate desired_starting_rate =
       relay_path_ ? kRelayStartingRate : kDirectStartingRate;
@@ -439,6 +577,7 @@ NetworkControlUpdate CongestionControl::OnNetworkAvailability(
   if (!network_available_) {
     pending_probe_.reset();
     // The link may come back as a different path; do not hold its old rate.
+    last_alr_start_time_.reset();
     ResetIdleRateHold();
   }
   NetworkControlUpdate update;
@@ -478,6 +617,18 @@ NetworkControlUpdate CongestionControl::OnProcessInterval(ProcessInterval msg) {
   std::optional<int64_t> start_time_ms =
       alr_detector_->GetApplicationLimitedRegionStartTime();
   probe_controller_->SetAlrStartTimeMs(start_time_ms);
+  bool sustained_alr_exited = false;
+  if (previously_in_alr_ && !start_time_ms.has_value()) {
+    acknowledged_bitrate_estimator_->SetAlrEndedTime(msg.at_time);
+    probe_controller_->SetAlrEndedTimeMs(msg.at_time.ms());
+    sustained_alr_exited =
+        last_alr_start_time_.has_value() &&
+        msg.at_time - *last_alr_start_time_ >= kIdleHoldMinAlrDwell;
+    last_alr_start_time_.reset();
+  } else if (start_time_ms.has_value()) {
+    last_alr_start_time_ = Timestamp::Millis(*start_time_ms);
+  }
+  previously_in_alr_ = start_time_ms.has_value();
 
   auto probes = probe_controller_->Process(msg.at_time);
   update.probe_cluster_configs.insert(update.probe_cluster_configs.end(),
@@ -486,6 +637,14 @@ NetworkControlUpdate CongestionControl::OnProcessInterval(ProcessInterval msg) {
 
   MaybeTriggerOnNetworkChanged(&update, msg.at_time);
   MaybeApplyPendingProbe(&update, msg.at_time);
+  if (sustained_alr_exited && ProbeNetworkHealthy()) {
+    const DataRate ref =
+        IdleHoldFloor(msg.at_time).value_or(last_loss_based_target_rate_);
+    auto exit_probes =
+        probe_controller_->RequestAlrExitProbe(msg.at_time, ref);
+    update.probe_cluster_configs.insert(update.probe_cluster_configs.end(),
+                                        exit_probes.begin(), exit_probes.end());
+  }
   return update;
 }
 
@@ -498,11 +657,14 @@ bool CongestionControl::ProbeNetworkHealthy() const {
 }
 
 std::optional<DataRate> CongestionControl::FilterProbeResult(
-    DataRate bitrate, int probe_id, Timestamp at_time) {
+    DataRate bitrate, int probe_id, bool saturated, Timestamp at_time) {
   if (pending_probe_ && pending_probe_->id != probe_id) {
     pending_probe_.reset();
   }
-  if (!ProbeNetworkHealthy()) {
+  const auto hold_floor = IdleHoldFloor(at_time);
+  const bool lowers_hold =
+      saturated && hold_floor.has_value() && bitrate < *hold_floor;
+  if (!ProbeNetworkHealthy() && !lowers_hold) {
     pending_probe_.reset();
     return bitrate;
   }
@@ -518,9 +680,11 @@ std::optional<DataRate> CongestionControl::FilterProbeResult(
   if (pending_probe_) {
     // Revisions update the candidate, never the original deadline.
     pending_probe_->bitrate = bitrate;
+    pending_probe_->saturated = saturated;
   } else {
     pending_probe_ = PendingProbe{probe_id, bitrate, reference,
-                                  at_time + kProbeEstimateSettleTime};
+                                  at_time + kProbeEstimateSettleTime,
+                                  saturated};
   }
   return std::nullopt;
 }
@@ -528,7 +692,11 @@ std::optional<DataRate> CongestionControl::FilterProbeResult(
 void CongestionControl::MaybeApplyPendingProbe(NetworkControlUpdate* update,
                                                Timestamp at_time) {
   if (!pending_probe_) return;
-  if (!ProbeNetworkHealthy()) {
+  const auto hold_floor = IdleHoldFloor(at_time);
+  const bool lowers_hold = pending_probe_->saturated &&
+                           hold_floor.has_value() &&
+                           pending_probe_->bitrate < *hold_floor;
+  if (!ProbeNetworkHealthy() && !lowers_hold) {
     pending_probe_.reset();
     return;
   }
@@ -545,10 +713,21 @@ void CongestionControl::MaybeApplyPendingProbe(NetworkControlUpdate* update,
   if (bandwidth_estimation_->target_rate() < probe.bitrate) {
     return;
   }
+  if (lowers_hold) {
+    // A saturated probe naturally triggers kBwOverusing at the bottleneck,
+    // which would make DelayBasedBwe::ApplyProbeResult ignore it while the
+    // hold keeps restoring the old floor. Apply the bottleneck rate directly.
+    OnIdleHoldSaturatedProbe(probe.bitrate, at_time);
+    MaybeTriggerOnNetworkChanged(update, at_time);
+    return;
+  }
   const auto result = delay_based_bwe_->ApplyProbeResult(
       probe.bitrate, at_time, acknowledged_bitrate_estimator_->bitrate(),
       alr_detector_->GetApplicationLimitedRegionStartTime().has_value());
   if (!result.updated || !result.probe) return;
+  if (probe.saturated) {
+    OnIdleHoldSaturatedProbe(result.target_bitrate, at_time);
+  }
   bandwidth_estimation_->SetSendBitrate(result.target_bitrate, at_time);
   bandwidth_estimation_->UpdateDelayBasedEstimate(at_time,
                                                   result.target_bitrate);
@@ -682,8 +861,7 @@ NetworkControlUpdate CongestionControl::OnTransportPacketsFeedback(
     lost_packets_since_last_loss_update_ += lost_in_report;
     UpdateIdleHoldFeedback(feedback_min_rtt,
                            static_cast<int64_t>(with_feedback.size()),
-                           lost_in_report, /*in_alr=*/true,
-                           /*delay_updated=*/false, report.feedback_time);
+                           lost_in_report, report.feedback_time);
     if (report.feedback_time > next_loss_update_) {
       next_loss_update_ =
           report.feedback_time + TimeDelta::Millis(kLossUpdateInterval);
@@ -697,10 +875,17 @@ NetworkControlUpdate CongestionControl::OnTransportPacketsFeedback(
   std::optional<int64_t> alr_start_time =
       alr_detector_->GetApplicationLimitedRegionStartTime();
 
+  bool sustained_alr_exited = false;
   if (previously_in_alr_ && !alr_start_time.has_value()) {
     int64_t now_ms = report.feedback_time.ms();
     acknowledged_bitrate_estimator_->SetAlrEndedTime(report.feedback_time);
     probe_controller_->SetAlrEndedTimeMs(now_ms);
+    sustained_alr_exited =
+        last_alr_start_time_.has_value() &&
+        report.feedback_time - *last_alr_start_time_ >= kIdleHoldMinAlrDwell;
+    last_alr_start_time_.reset();
+  } else if (alr_start_time.has_value()) {
+    last_alr_start_time_ = Timestamp::Millis(*alr_start_time);
   }
   previously_in_alr_ = alr_start_time.has_value();
 
@@ -723,8 +908,10 @@ NetworkControlUpdate CongestionControl::OnTransportPacketsFeedback(
   }
 
   int probe_id = -1;
+  bool probe_saturated = false;
   std::optional<DataRate> probe_bitrate =
-      probe_bitrate_estimator_->FetchAndResetLastEstimatedBitrate(&probe_id);
+      probe_bitrate_estimator_->FetchAndResetLastEstimatedBitrate(
+          &probe_id, &probe_saturated);
   if (limit_probes_lower_than_throughput_estimate_ && probe_bitrate &&
       acknowledged_bitrate) {
     // Limit the backoff to something slightly below the acknowledged
@@ -741,8 +928,8 @@ NetworkControlUpdate CongestionControl::OnTransportPacketsFeedback(
   }
 
   if (probe_bitrate) {
-    probe_bitrate =
-        FilterProbeResult(*probe_bitrate, probe_id, report.feedback_time);
+    probe_bitrate = FilterProbeResult(*probe_bitrate, probe_id,
+                                      probe_saturated, report.feedback_time);
   }
 
   NetworkControlUpdate update;
@@ -754,6 +941,9 @@ NetworkControlUpdate CongestionControl::OnTransportPacketsFeedback(
 
   if (result.updated) {
     if (result.probe) {
+      if (probe_saturated) {
+        OnIdleHoldSaturatedProbe(result.target_bitrate, report.feedback_time);
+      }
       bandwidth_estimation_->SetSendBitrate(result.target_bitrate,
                                             report.feedback_time);
     }
@@ -765,13 +955,16 @@ NetworkControlUpdate CongestionControl::OnTransportPacketsFeedback(
   bandwidth_estimation_->UpdateLossBasedEstimator(
       report, result.delay_detector_state, probe_bitrate,
       alr_start_time.has_value());
-  if (!ProbeNetworkHealthy()) pending_probe_.reset();
-  if (result.updated) {
-    // A delay-based update from feedback under load is what lets the idle
-    // hold learn a rate (not a start rate or a rate it has just restored).
-    UpdateIdleHoldFeedback(TimeDelta::PlusInfinity(), 0, 0,
-                           alr_start_time.has_value(), /*delay_updated=*/true,
+  UpdateIdleHoldDelayState(result.delay_detector_state,
+                           alr_start_time.has_value(), result.updated,
                            report.feedback_time);
+  if (!ProbeNetworkHealthy() &&
+      !(pending_probe_ && pending_probe_->saturated &&
+        IdleHoldFloor(report.feedback_time).has_value() &&
+        pending_probe_->bitrate < *IdleHoldFloor(report.feedback_time))) {
+    pending_probe_.reset();
+  }
+  if (result.updated || sustained_alr_exited) {
     // Update the estimate in the ProbeController, in case we want to probe.
     MaybeTriggerOnNetworkChanged(&update, report.feedback_time);
   }
@@ -785,7 +978,15 @@ NetworkControlUpdate CongestionControl::OnTransportPacketsFeedback(
     update.probe_cluster_configs.insert(update.probe_cluster_configs.end(),
                                         probes.begin(), probes.end());
   }
-
+  if (sustained_alr_exited && ProbeNetworkHealthy()) {
+    probe_controller_->SetAlrStartTimeMs(alr_start_time);
+    const DataRate ref = IdleHoldFloor(report.feedback_time)
+                             .value_or(last_loss_based_target_rate_);
+    auto probes =
+        probe_controller_->RequestAlrExitProbe(report.feedback_time, ref);
+    update.probe_cluster_configs.insert(update.probe_cluster_configs.end(),
+                                        probes.begin(), probes.end());
+  }
   // No valid RTT could be because send-side BWE isn't used, in which case
   // we don't try to limit the outstanding packets.
   // if (congestion_window_pushback_controller_ && current_data_window_) {

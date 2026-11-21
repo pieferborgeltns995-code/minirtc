@@ -38,6 +38,7 @@ constexpr int kMaxPathProbeAttempts = 3;
 constexpr TimeDelta kDropRecoveryWindow = TimeDelta::Seconds(10);
 constexpr TimeDelta kDropRecoveryInterval = TimeDelta::Seconds(1);
 constexpr int kMaxDropRecoveryAttempts = 3;
+constexpr TimeDelta kMinAlrExitProbeInterval = TimeDelta::Seconds(3);
 
 // Default probing bitrate limit. Applied only when the application didn't
 // specify max bitrate.
@@ -422,6 +423,38 @@ std::vector<ProbeClusterConfig> ProbeController::RequestProbe(
   return MaybeProbeAfterDrop(at_time);
 }
 
+std::vector<ProbeClusterConfig> ProbeController::RequestAlrExitProbe(
+    Timestamp at_time, DataRate reference_rate) {
+  // Periodic ALR probes often stall in kWaitingForProbingResult because an
+  // idle desktop has no media packets to carry them. When motion resumes, let
+  // the ALR-exit probe supersede a stalled idle probe and use its own cooldown.
+  if (!network_available_ || pending_path_probe_ || pending_drop_recovery_ ||
+      estimated_bitrate_.IsZero()) {
+    return {};
+  }
+  if (at_time - last_alr_exit_probe_time_ < kMinAlrExitProbeInterval) {
+    return {};
+  }
+  const DataRate base = std::max(estimated_bitrate_, reference_rate);
+  DataRate max_probe_bitrate = max_bitrate_;
+  if (max_total_allocated_bitrate_ > DataRate::Zero()) {
+    max_probe_bitrate = std::min(
+        max_probe_bitrate,
+        std::max(max_total_allocated_bitrate_, base) * 2);
+  }
+  if (base >= max_probe_bitrate * 0.9) {
+    return {};
+  }
+  last_alr_exit_probe_time_ = at_time;
+  const DataRate target = base * config_.alr_probe_scale;
+  LOG_INFO(
+      "Initiating ALR-exit probe: estimated_bps={} reference_bps={} "
+      "target_bps={} max_allocated_bps={}",
+      estimated_bitrate_.bps(), reference_rate.bps(), target.bps(),
+      max_total_allocated_bitrate_.bps());
+  return InitiateProbing(at_time, {target}, /*probe_further=*/true);
+}
+
 std::vector<ProbeClusterConfig> ProbeController::MaybeProbeAfterDrop(
     Timestamp at_time) {
   if (!pending_drop_recovery_) return {};
@@ -474,6 +507,7 @@ void ProbeController::Reset(Timestamp at_time) {
   state_ = State::kInit;
   min_bitrate_to_probe_further_ = DataRate::PlusInfinity();
   time_last_probing_initiated_ = Timestamp::Zero();
+  last_alr_exit_probe_time_ = Timestamp::MinusInfinity();
   estimated_bitrate_ = DataRate::Zero();
   network_estimate_ = std::nullopt;
   start_bitrate_ = DataRate::Zero();
@@ -626,8 +660,9 @@ std::vector<ProbeClusterConfig> ProbeController::InitiateProbing(
     // progress.
     // It also avoids minor quality reduction caused by probes often being
     // received at slightly less than the target probe bitrate.
-    max_probe_bitrate =
-        std::min(max_probe_bitrate, max_total_allocated_bitrate_ * 2);
+    max_probe_bitrate = std::min(
+        max_probe_bitrate,
+        std::max(max_total_allocated_bitrate_, estimated_bitrate_) * 2);
   }
 
   switch (bandwidth_limited_cause_) {

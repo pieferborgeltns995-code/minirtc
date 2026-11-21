@@ -579,6 +579,7 @@ class IceTransportController
 
  private:
   int video_bitrate_limit_bps_ = 0;  // Accessed only on the congestion queue.
+  int64_t allocated_video_bitrate_bps_ = 0;  // Accessed only on the congestion queue.
   int64_t target_bitrate_ = 0;
   int64_t available_transport_bitrate_ = 0;
 

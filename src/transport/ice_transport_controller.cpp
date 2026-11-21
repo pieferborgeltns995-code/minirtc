@@ -29,8 +29,10 @@
 namespace minirtc {
 namespace {
 
-constexpr int64_t kDesktopPacerQueueLimitMs = 100;
-constexpr int64_t kDesktopFrameAdmissionQueueMs = 80;
+constexpr int64_t kDesktopPacerQueueLimitMs =
+    VideoFrameCadence::kHardOldestPacketWaitMs;
+constexpr int64_t kDesktopFrameAdmissionQueueMs =
+    VideoFrameCadence::kRelaxedAdmissionQueueMs;
 // At the normal 2.5x pacing rate this occupies at most 72 ms of the queue,
 // leaving room for RTP overhead and recovery within the 350 ms deadline.
 constexpr int64_t kDesktopKeyFrameBudgetMs = 180;
@@ -774,15 +776,18 @@ int IceTransportController::SendVideo(const MiniRtcVideoFrame* video_frame,
       return 0;
     context->capture_input_frame_total.fetch_add(1,
                                                  std::memory_order_relaxed);
-    if (media_config_.video_content_type == MiniRtcVideoContentType::ScreenContent &&
+    if (media_config_.video_content_type ==
+            MiniRtcVideoContentType::ScreenContent &&
         paced_sender_ &&
-        (paced_sender_->ExpectedQueueTime() >=
-             TimeDelta::Millis(kDesktopFrameAdmissionQueueMs) ||
-         paced_sender_->OldestPacketWaitTime() >=
-             TimeDelta::Millis(kDesktopPacerQueueLimitMs))) {
-      // Remote desktop frames expire quickly. Stop admitting new frames while
-      // the packet queue drains instead of extending end-to-end latency with
-      // content the viewer will only see long after it was captured.
+        !video_frame_cadences_[channel_name].AdmitScreenFrame(
+            clock_->CurrentTimeUs(), media_config_.max_frame_rate,
+            paced_sender_->ExpectedQueueTime().ms(),
+            paced_sender_->OldestPacketWaitTime().ms(),
+            context->last_network_rtt_ms, context->last_network_loss_pct,
+            is_congested_.load())) {
+      // Under delay/loss pressure, pace the admitted frame rate down evenly
+      // instead of dropping a contiguous batch; only block outright once the
+      // queue hits the hard latency ceiling.
       context->pacer_rejected_frame_total.fetch_add(
           1, std::memory_order_relaxed);
       return 0;
@@ -3943,7 +3948,7 @@ void IceTransportController::UpdateFecProtection() {
   const auto mode = video_fec_enabled_ ? fec_mode_.load() : FecMode::kOff;
   const bool log = fec_log_ms_ < 0 || now_ms - fec_log_ms_ >= 5000;
   bool publish = false;
-  int64_t media_total = 0, fec_total = 0;
+  int64_t media_total = 0, fec_total = 0, allocated_total = 0;
   {
     std::unique_lock lock(stream_senders_mutex_);
     const uint64_t version = ++fec_config_version_;
@@ -3977,6 +3982,10 @@ void IceTransportController::UpdateFecProtection() {
       const auto &c = item.second;
       if (!c || c->type != StreamType::kVideo || !c->transceiver)
         continue;
+      if (!video_send_paused_ && c->codec) {
+        allocated_total +=
+            c->applied_target_bitrate.value_or(media_config_.init_bitrate);
+      }
       const uint32_t ssrc = c->ssrc.value_or(0), rtx = c->rtx_ssrc.value_or(0);
       FecNetworkSnapshot network;
       network.now_ms = now_ms;
@@ -4055,8 +4064,28 @@ void IceTransportController::UpdateFecProtection() {
                         .media_bitrate_bps;
     }
     video_transport_bitrate_bps_.store(media_total);
+    if (allocated_total > 0) {
+      allocated_total = std::max(allocated_total, media_total + fec_total);
+      if (limit > 0) {
+        allocated_total = std::min<int64_t>(allocated_total, limit);
+      }
+    }
     publish = !fec_update_queued_;
     fec_update_queued_ = true;
+  }
+  if (controller_ && allocated_total != allocated_video_bitrate_bps_) {
+    allocated_video_bitrate_bps_ = allocated_total;
+    auto alloc_update = controller_->SetMaxTotalAllocatedBitrate(
+        DataRate::BitsPerSec(allocated_total),
+        webrtc::Timestamp::Millis(webrtc_clock_->TimeInMilliseconds()));
+    if (!alloc_update.probe_cluster_configs.empty() && task_queue_pacer_ &&
+        paced_sender_) {
+      auto clusters = std::move(alloc_update.probe_cluster_configs);
+      task_queue_pacer_->PostTask(
+          [this, clusters = std::move(clusters)]() mutable {
+            paced_sender_->CreateProbeClusters(std::move(clusters));
+          });
+    }
   }
   if (log) {
     fec_log_ms_ = now_ms;
