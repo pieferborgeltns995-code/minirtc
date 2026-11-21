@@ -20,12 +20,16 @@ class VideoFrameCadence {
  public:
   // Without network delay or loss evidence, allow up to 240 ms of pacer queue
   // (and 280 ms oldest packet wait) so scene-change bursts drain without
-  // dropping a batch of frames. When RTT excess, packet loss or congestion
-  // confirms network pressure, tighten the hard ceiling to 160 ms.
+  // dropping a batch of frames. When RTT excess, heavy packet loss or
+  // congestion confirms network pressure, tighten the hard ceiling to 160 ms.
+  // Ordinary Wi-Fi random loss (a few percent) is repaired by FEC/NACK and
+  // must not lock the stream to a lower frame rate by itself.
   static constexpr int64_t kRelaxedAdmissionQueueMs = 240;
   static constexpr int64_t kCongestedAdmissionQueueMs = 160;
   static constexpr int64_t kHardOldestPacketWaitMs = 280;
   static constexpr int kMinScreenFrameRate = 15;
+  static constexpr int kPressureLossPercent = 10;
+  static constexpr int kSevereLossPercent = 20;
 
   bool Accept(int64_t now_us, int frame_rate) {
     const int64_t interval_us = 1000000 / std::max(1, frame_rate);
@@ -46,8 +50,9 @@ class VideoFrameCadence {
                         int64_t rtt_ms, int loss_pct, bool congested) {
     UpdateRttBaseline(now_us, rtt_ms);
     const int64_t rtt_excess_ms = RttExcessMs(rtt_ms);
-    const bool network_pressured =
-        congested || loss_pct >= 2 || rtt_excess_ms >= 60;
+    const bool network_pressured = congested ||
+                                   loss_pct >= kPressureLossPercent ||
+                                   rtt_excess_ms >= 60;
     const int64_t hard_queue_limit_ms = network_pressured
                                             ? kCongestedAdmissionQueueMs
                                             : kRelaxedAdmissionQueueMs;
@@ -58,19 +63,19 @@ class VideoFrameCadence {
 
     int desired_level = 0;
     if (!network_pressured) {
-      // No loss and no RTT build-up: let normal encoder bursts (<160 ms) pass
-      // at full frame rate, and gently halve the rate in the 160-240 ms band.
+      // No heavy loss and no RTT build-up: let normal encoder bursts
+      // (<160 ms) pass at full frame rate, and gently halve the rate in the
+      // 160-240 ms band.
       if (expected_queue_ms >= kCongestedAdmissionQueueMs) {
         desired_level = 2;
       }
-    } else if (rtt_excess_ms >= 150 || loss_pct >= 10 ||
+    } else if (rtt_excess_ms >= 150 || loss_pct >= kSevereLossPercent ||
                expected_queue_ms >= 130) {
       desired_level = 3;
-    } else if (rtt_excess_ms >= 100 || loss_pct >= 5 ||
+    } else if (rtt_excess_ms >= 100 || loss_pct >= kPressureLossPercent ||
                expected_queue_ms >= 90 || congested) {
       desired_level = 2;
-    } else if (rtt_excess_ms >= 60 || loss_pct >= 2 ||
-               expected_queue_ms >= 60) {
+    } else if (rtt_excess_ms >= 60 || expected_queue_ms >= 60) {
       desired_level = 1;
     }
 

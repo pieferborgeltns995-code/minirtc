@@ -76,8 +76,9 @@ class CongestionControl {
   void UpdateIdleHoldDelayState(BandwidthUsage delay_state, bool in_alr,
                                 bool delay_updated, Timestamp at_time);
   // A complete probe whose receive rate fell clearly below its send rate
-  // measured a real bottleneck; align the held floor with it.
-  void OnIdleHoldSaturatedProbe(DataRate bitrate, Timestamp at_time);
+  // measured a real bottleneck; lower the held floor towards it (bounded per
+  // probe). Returns the rate that was applied, or `bitrate` if unchanged.
+  DataRate OnIdleHoldSaturatedProbe(DataRate bitrate, Timestamp at_time);
   void UpdateIdleRateHold(bool in_alr, Timestamp at_time);
   void ApplyIdleRateHold(Timestamp at_time);
  private:

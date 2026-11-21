@@ -175,9 +175,9 @@ std::vector<ProbeClusterConfig> ProbeController::OnMaxTotalAllocatedBitrate(
               allow_further_probing);
     return InitiateProbing(at_time, probes, allow_further_probing);
   }
-  if (!max_total_allocated_bitrate.IsZero()) {
-    last_allowed_repeated_initial_probe_ = at_time;
-  }
+  // MiniRTC reports the encoder ceiling here, not an application need, so a
+  // known allocation must not end bootstrap probing early (upstream WebRTC
+  // stops repeated initial probing once an allocation is set).
 
   max_total_allocated_bitrate_ = max_total_allocated_bitrate;
   return std::vector<ProbeClusterConfig>();
@@ -230,8 +230,7 @@ std::vector<ProbeClusterConfig> ProbeController::InitiateExponentialProbing(
       config_.second_exponential_probe_scale > 0) {
     probes.push_back(config_.second_exponential_probe_scale * start_bitrate_);
   }
-  if (repeated_initial_probing_enabled_ &&
-      max_total_allocated_bitrate_.IsZero()) {
+  if (repeated_initial_probing_enabled_) {
     last_allowed_repeated_initial_probe_ =
         at_time + config_.repeated_initial_probing_time_period;
     LOG_DEBUG(
@@ -438,21 +437,26 @@ std::vector<ProbeClusterConfig> ProbeController::RequestAlrExitProbe(
   const DataRate base = std::max(estimated_bitrate_, reference_rate);
   DataRate max_probe_bitrate = max_bitrate_;
   if (max_total_allocated_bitrate_ > DataRate::Zero()) {
-    max_probe_bitrate = std::min(
-        max_probe_bitrate,
-        std::max(max_total_allocated_bitrate_, base) * 2);
+    max_probe_bitrate =
+        std::min(max_probe_bitrate, max_total_allocated_bitrate_ * 2);
   }
   if (base >= max_probe_bitrate * 0.9) {
     return {};
   }
-  last_alr_exit_probe_time_ = at_time;
   const DataRate target = base * config_.alr_probe_scale;
+  auto probes = InitiateProbing(at_time, {target}, /*probe_further=*/true);
+  if (probes.empty()) {
+    // E.g. delay/loss-limited: retry on the next sustained ALR exit.
+    return probes;
+  }
+  last_alr_exit_probe_time_ = at_time;
   LOG_INFO(
       "Initiating ALR-exit probe: estimated_bps={} reference_bps={} "
       "target_bps={} max_allocated_bps={}",
-      estimated_bitrate_.bps(), reference_rate.bps(), target.bps(),
+      estimated_bitrate_.bps(), reference_rate.bps(),
+      probes.back().target_data_rate.bps(),
       max_total_allocated_bitrate_.bps());
-  return InitiateProbing(at_time, {target}, /*probe_further=*/true);
+  return probes;
 }
 
 std::vector<ProbeClusterConfig> ProbeController::MaybeProbeAfterDrop(
@@ -660,9 +664,8 @@ std::vector<ProbeClusterConfig> ProbeController::InitiateProbing(
     // progress.
     // It also avoids minor quality reduction caused by probes often being
     // received at slightly less than the target probe bitrate.
-    max_probe_bitrate = std::min(
-        max_probe_bitrate,
-        std::max(max_total_allocated_bitrate_, estimated_bitrate_) * 2);
+    max_probe_bitrate =
+        std::min(max_probe_bitrate, max_total_allocated_bitrate_ * 2);
   }
 
   switch (bandwidth_limited_cause_) {

@@ -31,8 +31,11 @@ namespace {
 
 constexpr int64_t kDesktopPacerQueueLimitMs =
     VideoFrameCadence::kHardOldestPacketWaitMs;
-constexpr int64_t kDesktopFrameAdmissionQueueMs =
-    VideoFrameCadence::kRelaxedAdmissionQueueMs;
+// MaintainFrameRate keeps the original tight admission: it degrades
+// resolution on sustained pacer rejection rather than pacing the frame rate
+// down, so it must not inherit the relaxed delay-based cadence.
+constexpr int64_t kFrameRatePriorityAdmissionQueueMs = 80;
+constexpr int64_t kFrameRatePriorityOldestPacketWaitMs = 100;
 // At the normal 2.5x pacing rate this occupies at most 72 ms of the queue,
 // leaving room for RTP overhead and recovery within the 350 ms deadline.
 constexpr int64_t kDesktopKeyFrameBudgetMs = 180;
@@ -778,19 +781,30 @@ int IceTransportController::SendVideo(const MiniRtcVideoFrame* video_frame,
                                                  std::memory_order_relaxed);
     if (media_config_.video_content_type ==
             MiniRtcVideoContentType::ScreenContent &&
-        paced_sender_ &&
-        !video_frame_cadences_[channel_name].AdmitScreenFrame(
-            clock_->CurrentTimeUs(), media_config_.max_frame_rate,
-            paced_sender_->ExpectedQueueTime().ms(),
-            paced_sender_->OldestPacketWaitTime().ms(),
-            context->last_network_rtt_ms, context->last_network_loss_pct,
-            is_congested_.load())) {
+        paced_sender_) {
+      const int64_t expected_queue_ms =
+          paced_sender_->ExpectedQueueTime().ms();
+      const int64_t oldest_wait_ms =
+          paced_sender_->OldestPacketWaitTime().ms();
       // Under delay/loss pressure, pace the admitted frame rate down evenly
       // instead of dropping a contiguous batch; only block outright once the
-      // queue hits the hard latency ceiling.
-      context->pacer_rejected_frame_total.fetch_add(
-          1, std::memory_order_relaxed);
-      return 0;
+      // queue hits the hard latency ceiling. MaintainFrameRate instead keeps
+      // the tight queue limit and lets the resolution adapter react.
+      const bool admitted =
+          media_config_.video_degradation_preference ==
+                  MiniRtcVideoDegradationPreference::MaintainFrameRate
+              ? expected_queue_ms < kFrameRatePriorityAdmissionQueueMs &&
+                    oldest_wait_ms < kFrameRatePriorityOldestPacketWaitMs
+              : video_frame_cadences_[channel_name].AdmitScreenFrame(
+                    clock_->CurrentTimeUs(), media_config_.max_frame_rate,
+                    expected_queue_ms, oldest_wait_ms,
+                    context->last_network_rtt_ms,
+                    context->last_network_loss_pct, is_congested_.load());
+      if (!admitted) {
+        context->pacer_rejected_frame_total.fetch_add(
+            1, std::memory_order_relaxed);
+        return 0;
+      }
     }
 
     RawFrame raw_frame = native_frame
@@ -3982,9 +3996,13 @@ void IceTransportController::UpdateFecProtection() {
       const auto &c = item.second;
       if (!c || c->type != StreamType::kVideo || !c->transceiver)
         continue;
+      // Report the encoder ceiling, not the current target. Probes are capped
+      // at twice this value, so a target-based allocation would keep every
+      // probe within 2x of the present estimate and slow down ramp-up. Do not
+      // require recent capture so a static desktop does not flap 0<->ceiling.
       if (!video_send_paused_ && c->codec) {
-        allocated_total +=
-            c->applied_target_bitrate.value_or(media_config_.init_bitrate);
+        allocated_total += std::max(media_config_.max_bitrate,
+                                    media_config_.init_bitrate);
       }
       const uint32_t ssrc = c->ssrc.value_or(0), rtx = c->rtx_ssrc.value_or(0);
       FecNetworkSnapshot network;
@@ -4064,11 +4082,8 @@ void IceTransportController::UpdateFecProtection() {
                         .media_bitrate_bps;
     }
     video_transport_bitrate_bps_.store(media_total);
-    if (allocated_total > 0) {
-      allocated_total = std::max(allocated_total, media_total + fec_total);
-      if (limit > 0) {
-        allocated_total = std::min<int64_t>(allocated_total, limit);
-      }
+    if (allocated_total > 0 && limit > 0) {
+      allocated_total = std::min<int64_t>(allocated_total, limit);
     }
     publish = !fec_update_queued_;
     fec_update_queued_ = true;

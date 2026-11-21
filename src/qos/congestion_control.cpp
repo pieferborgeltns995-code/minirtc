@@ -49,6 +49,8 @@ constexpr TimeDelta kIdleHoldMinGrace = TimeDelta::Millis(500);
 constexpr double kIdleHoldGraceEndAckedRatio = 0.50;
 // Below this there is nothing worth protecting.
 constexpr DataRate kIdleHoldMinRate = DataRate::BitsPerSec(1000000);
+// Deepest reduction one saturated probe may apply to the held rate.
+constexpr double kIdleHoldMaxProbeCut = 0.5;
 // Only confirmed congestion lowers the held rate. Like RustDesk's TestDelay,
 // queueing delay above the path baseline counts, and one bad sample is
 // jitter: kIdleHoldBadRttSamples consecutive fresh feedback RTTs must exceed
@@ -307,16 +309,20 @@ void CongestionControl::UpdateIdleHoldDelayState(BandwidthUsage delay_state,
   idle_hold_last_overuse_sample_ = at_time;
 }
 
-void CongestionControl::OnIdleHoldSaturatedProbe(DataRate bitrate,
-                                                 Timestamp at_time) {
-  if (!idle_rate_hold_enabled_) return;
+DataRate CongestionControl::OnIdleHoldSaturatedProbe(DataRate bitrate,
+                                                     Timestamp at_time) {
+  if (!idle_rate_hold_enabled_) return bitrate;
   const auto floor = IdleHoldFloor(at_time);
-  if (!floor || bitrate >= *floor) return;
-  const DataRate lowered = std::max(bitrate, min_data_rate_);
+  if (!floor || bitrate >= *floor) return bitrate;
+  // A single short probe cluster can be distorted by a Wi-Fi stall. Limit one
+  // probe to RustDesk's deepest ratio step (x0.5); a genuinely smaller link
+  // keeps producing saturated probes or confirmed delay/loss and goes lower.
+  const DataRate lowered =
+      std::max({bitrate, *floor * kIdleHoldMaxProbeCut, min_data_rate_});
   LOG_INFO(
-      "Idle rate hold lowered by saturated probe: held_bps={} new_bps={} "
-      "in_alr={}",
-      idle_hold_rate_.bps(), lowered.bps(), idle_hold_in_alr_);
+      "Idle rate hold lowered by saturated probe: held_bps={} probe_bps={} "
+      "new_bps={} in_alr={}",
+      idle_hold_rate_.bps(), bitrate.bps(), lowered.bps(), idle_hold_in_alr_);
   idle_hold_rate_ = lowered;
   if (!idle_hold_in_alr_) {
     // Fresh probe capacity under load supersedes the post-idle grace window.
@@ -325,6 +331,7 @@ void CongestionControl::OnIdleHoldSaturatedProbe(DataRate bitrate,
   delay_based_bwe_->SetEstimate(lowered, at_time);
   bandwidth_estimation_->SetSendBitrate(lowered, at_time);
   bandwidth_estimation_->UpdateDelayBasedEstimate(at_time, lowered);
+  return lowered;
 }
 
 std::optional<DataRate> CongestionControl::IdleHoldFloor(
@@ -725,12 +732,16 @@ void CongestionControl::MaybeApplyPendingProbe(NetworkControlUpdate* update,
       probe.bitrate, at_time, acknowledged_bitrate_estimator_->bitrate(),
       alr_detector_->GetApplicationLimitedRegionStartTime().has_value());
   if (!result.updated || !result.probe) return;
+  DataRate applied = result.target_bitrate;
   if (probe.saturated) {
-    OnIdleHoldSaturatedProbe(result.target_bitrate, at_time);
+    applied = OnIdleHoldSaturatedProbe(applied, at_time);
+    if (applied != result.target_bitrate) {
+      // Bounded hold cut: keep the delay-based estimate in step with it.
+      delay_based_bwe_->SetEstimate(applied, at_time);
+    }
   }
-  bandwidth_estimation_->SetSendBitrate(result.target_bitrate, at_time);
-  bandwidth_estimation_->UpdateDelayBasedEstimate(at_time,
-                                                  result.target_bitrate);
+  bandwidth_estimation_->SetSendBitrate(applied, at_time);
+  bandwidth_estimation_->UpdateDelayBasedEstimate(at_time, applied);
   MaybeTriggerOnNetworkChanged(update, at_time);
 }
 
@@ -942,7 +953,13 @@ NetworkControlUpdate CongestionControl::OnTransportPacketsFeedback(
   if (result.updated) {
     if (result.probe) {
       if (probe_saturated) {
-        OnIdleHoldSaturatedProbe(result.target_bitrate, report.feedback_time);
+        const DataRate applied = OnIdleHoldSaturatedProbe(
+            result.target_bitrate, report.feedback_time);
+        if (applied != result.target_bitrate) {
+          // Bounded hold cut: keep the delay-based estimate in step with it.
+          delay_based_bwe_->SetEstimate(applied, report.feedback_time);
+          result.target_bitrate = applied;
+        }
       }
       bandwidth_estimation_->SetSendBitrate(result.target_bitrate,
                                             report.feedback_time);
