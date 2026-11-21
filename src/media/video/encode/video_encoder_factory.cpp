@@ -9,6 +9,7 @@
 
 #if defined(_WIN32) || defined(_WIN64)
 #include "amf/amf_av1_encoder.h"
+#include "amf/amf_hevc_encoder.h"
 #include "wmf/wmf_av1_encoder.h"
 #include "wmf/wmf_h264_encoder.h"
 #include "wmf/wmf_hevc_encoder.h"
@@ -83,6 +84,10 @@ std::unique_ptr<MediaCodec> VideoEncoderFactory::CreateVideoEncoder(
   }
   if (codec_type == VideoCodecType::HEVC) {
 #if defined(_WIN32) || defined(_WIN64)
+    if (hardware_acceleration && AmfHevcEncoder::IsSupported()) {
+      LOG_INFO("Using the AMD AMF hardware HEVC encoder");
+      return std::make_unique<AmfHevcEncoder>(clock);
+    }
     if (hardware_acceleration && WmfHevcEncoder::IsSupported()) {
       LOG_INFO("Using the Media Foundation hardware HEVC encoder");
       return std::make_unique<WmfHevcEncoder>(clock);
@@ -174,8 +179,24 @@ std::unique_ptr<MediaCodec> VideoEncoderFactory::CreateInitializedVideoEncoder(
     return TryInitEncoder(std::make_unique<SvtAv1Encoder>(clock), config);
   }
   if (codec_type == VideoCodecType::HEVC) {
-    if (hardware_acceleration && WmfHevcEncoder::IsSupported()) {
-      return TryInitEncoder(std::make_unique<WmfHevcEncoder>(clock), config);
+    if (hardware_acceleration) {
+      if (AmfHevcEncoder::IsSupported()) {
+        if (auto encoder = TryInitEncoder(
+                std::make_unique<AmfHevcEncoder>(clock), config)) {
+          LOG_INFO("Using the AMD AMF hardware HEVC encoder");
+          return encoder;
+        }
+        LOG_WARN(
+            "AMD AMF HEVC encoder initialization failed; trying Media "
+            "Foundation HEVC");
+      }
+      if (WmfHevcEncoder::IsSupported()) {
+        if (auto encoder = TryInitEncoder(
+                std::make_unique<WmfHevcEncoder>(clock), config)) {
+          LOG_INFO("Using the Media Foundation hardware HEVC encoder");
+          return encoder;
+        }
+      }
     }
     return nullptr;
   }
@@ -230,7 +251,7 @@ bool VideoEncoderFactory::CheckIsHardwareAccelerationSupported(
     return AmfAv1Encoder::IsSupported() || WmfAv1Encoder::IsSupported();
   }
   if (codec_type == VideoCodecType::HEVC) {
-    return WmfHevcEncoder::IsSupported();
+    return AmfHevcEncoder::IsSupported() || WmfHevcEncoder::IsSupported();
   }
 #elif defined(__APPLE__) && !defined(MINIRTC_IOS)
   if (codec_type == VideoCodecType::HEVC) {
