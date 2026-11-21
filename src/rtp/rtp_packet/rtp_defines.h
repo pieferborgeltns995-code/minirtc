@@ -22,6 +22,7 @@ typedef enum {
   H264_FEC_SOURCE = 97,
   H264_FEC_REPAIR = 98,
   AV1 = 99,
+  HEVC = 102,
   OPUS = 111,
   RS_FEC = 122,
   RTX = 127,

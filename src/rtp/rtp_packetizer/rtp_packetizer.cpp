@@ -5,6 +5,7 @@
 #include "rtp_packetizer_av1.h"
 #include "rtp_packetizer_generic.h"
 #include "rtp_packetizer_h264.h"
+#include "rtp_packetizer_hevc.h"
 #include "rtp_header_extension.h"
 
 namespace minirtc {
@@ -16,6 +17,8 @@ std::unique_ptr<RtpPacketizer> RtpPacketizer::Create(uint32_t payload_type,
       return std::make_unique<RtpPacketizerH264>(ssrc);
     case rtp::PAYLOAD_TYPE::AV1:
       return std::make_unique<RtpPacketizerAv1>(ssrc);
+    case rtp::PAYLOAD_TYPE::HEVC:
+      return std::make_unique<RtpPacketizerHevc>(ssrc);
     default:
       return std::make_unique<RtpPacketizerGeneric>(ssrc, payload_type);
   }

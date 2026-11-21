@@ -476,6 +476,9 @@ int PacedSender::EnqueueRtpPackets(
       case rtp::PAYLOAD_TYPE::AV1:
         rtp_packet_to_send->set_packet_type(webrtc::RtpPacketMediaType::kVideo);
         break;
+      case rtp::PAYLOAD_TYPE::HEVC:
+        rtp_packet_to_send->set_packet_type(webrtc::RtpPacketMediaType::kVideo);
+        break;
       case rtp::PAYLOAD_TYPE::H264_FEC_SOURCE:
         rtp_packet_to_send->set_packet_type(
             webrtc::RtpPacketMediaType::kForwardErrorCorrection);

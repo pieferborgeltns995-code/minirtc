@@ -28,7 +28,7 @@ namespace minirtc {
 class IceTransport {
  public:
   typedef enum { MiniRtcDataTypeVideo = 96, MiniRtcDataTypeAudio = 97, MiniRtcDataTypeData = 120 } MiniRtcDataType;
-  typedef enum { H264 = 96, AV1 = 99 } VIDEO_TYPE;
+  typedef enum { H264 = 96, AV1 = 99, HEVC = 102 } VIDEO_TYPE;
   enum VideoFrameType {
     kEmptyFrame = 0,
     kVideoFrameKey = 3,

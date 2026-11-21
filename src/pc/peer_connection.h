@@ -80,6 +80,7 @@ typedef struct {
   void* user_data;
   MiniRtcOnSignalExchange on_signal_exchange;
   MiniRtcOnReceiveEncodedVideo on_receive_encoded_video;
+  MiniRtcVideoCodec video_codec = MiniRtcVideoCodecDefault;
 } PeerConnectionParams;
 
 class PeerConnection {
@@ -97,6 +98,9 @@ class PeerConnection {
   void ReportDirectError(MiniRtcDirectError error);
   int UpdateConnectionSettings(bool hardware_acceleration, bool av1_encoding,
                                 MiniRtcTurnMode turn_mode);
+  int UpdateConnectionSettings(bool hardware_acceleration,
+                               MiniRtcVideoCodec video_codec,
+                               MiniRtcTurnMode turn_mode);
 
   int Join(const std::string& transmission_id);
 
@@ -204,6 +208,7 @@ class PeerConnection {
   bool hardware_acceleration_ = false;
   bool native_video_output_ = false;
   bool av1_encoding_ = false;
+  MiniRtcVideoCodec video_codec_ = MiniRtcVideoCodecDefault;
   MiniRtcTurnMode turn_mode_ = MiniRtcTurnMode::MiniRtcTurnDisabled;
   bool enable_srtp_ = true;
   MiniRtcVideoContentType video_content_type_ = MiniRtcVideoContentType::ScreenContent;

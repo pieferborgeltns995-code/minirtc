@@ -5,6 +5,7 @@
 #include "dav1d/dav1d_av1_decoder.h"
 #if defined(_WIN32) || defined(_WIN64)
 #include "wmf/d3d11_h264_decoder.h"
+#include "wmf/d3d11_hevc_decoder.h"
 #endif
 #if !defined(MINIRTC_IOS)
 #include "openh264/openh264_decoder.h"
@@ -91,6 +92,22 @@ std::unique_ptr<MediaCodec> VideoDecoderFactory::CreateVideoDecoder(
     // Software decoders disable native output on unsupported platforms.
     return std::make_unique<Dav1dAv1Decoder>(clock, native_video_output);
   }
+  if (codec_type == VideoCodecType::HEVC) {
+#if defined(_WIN32) || defined(_WIN64)
+    if (D3D11HevcDecoder::IsSupported()) {
+      LOG_INFO("Using the Media Foundation HEVC decoder");
+      return std::make_unique<D3D11HevcDecoder>(clock, native_video_output);
+    }
+#elif defined(__APPLE__) && !defined(MINIRTC_IOS)
+    if (hardware_acceleration && VideoToolboxDecoder::IsHevcSupported()) {
+      LOG_INFO("Using the VideoToolbox hardware HEVC decoder");
+      return std::make_unique<VideoToolboxDecoder>(clock, native_video_output,
+                                                   VideoCodecType::HEVC);
+    }
+#endif
+    LOG_ERROR("HEVC decoding is unavailable on this platform");
+    return nullptr;
+  }
 
   if (codec_type != VideoCodecType::H264) {
     LOG_ERROR("Unsupported video codec type [{}]",
@@ -157,6 +174,13 @@ std::unique_ptr<MediaCodec> VideoDecoderFactory::CreateInitializedVideoDecoder(
     return TryInitDecoder(
         std::make_unique<OpenH264Decoder>(clock, native_video_output));
   }
+  if (codec_type == VideoCodecType::HEVC) {
+    if (D3D11HevcDecoder::IsSupported()) {
+      return TryInitDecoder(
+          std::make_unique<D3D11HevcDecoder>(clock, native_video_output));
+    }
+    return nullptr;
+  }
 #endif
   auto decoder = TryInitDecoder(CreateVideoDecoder(
       clock, hardware_acceleration, codec_type, native_video_output));
@@ -186,8 +210,20 @@ bool VideoDecoderFactory::CheckIsHardwareAccelerationSupported(
   if (codec_type == VideoCodecType::AV1) {
     return VTIsHardwareDecodeSupported(kCMVideoCodecType_AV1);
   }
+#if !defined(MINIRTC_IOS)
+  if (codec_type == VideoCodecType::HEVC) {
+    return VideoToolboxDecoder::IsHevcSupported();
+  }
+#endif
   return false;
 #else
+  if (codec_type == VideoCodecType::HEVC) {
+#if defined(_WIN32) || defined(_WIN64)
+    return D3D11HevcDecoder::IsSupported();
+#else
+    return false;
+#endif
+  }
   if (codec_type != VideoCodecType::H264) {
     return false;
   }

@@ -1179,26 +1179,33 @@ void IceTransport::AppendLocalSenderSsrcAttributes(
 
 int IceTransport::AppendLocalCapabilitiesToOffer() {
   std::string preferred_video_pt;
-  std::string video_capabilities = "UDP/TLS/RTP/SAVPF ";
+  std::string video_capabilities = "UDP/TLS/RTP/SAVPF";
   const std::string audio_capabilities = "UDP/TLS/RTP/SAVPF 111";
   const std::string data_capabilities = "UDP/TLS/RTP/SAVPF 120 121";
 
-  switch (prefered_video_payload_type_) {
-    case rtp::PAYLOAD_TYPE::H264: {
-      preferred_video_pt = std::to_string(rtp::PAYLOAD_TYPE::H264);
-      video_capabilities += preferred_video_pt + " 99";
-      break;
+  std::vector<int> ordered_video_pts;
+  auto push_unique_pt = [&](int pt) {
+    if (std::find(ordered_video_pts.begin(), ordered_video_pts.end(), pt) ==
+        ordered_video_pts.end()) {
+      ordered_video_pts.push_back(pt);
     }
-    case rtp::PAYLOAD_TYPE::AV1: {
-      preferred_video_pt = std::to_string(rtp::PAYLOAD_TYPE::AV1);
-      video_capabilities += preferred_video_pt + " 96";
-      break;
-    }
-    default: {
-      preferred_video_pt = std::to_string(rtp::PAYLOAD_TYPE::H264);
-      video_capabilities += preferred_video_pt + " 99";
-      break;
-    }
+  };
+  const int preferred_pt_value = static_cast<int>(prefered_video_payload_type_);
+  if (std::find(support_video_payload_types_.begin(),
+                support_video_payload_types_.end(),
+                preferred_pt_value) != support_video_payload_types_.end()) {
+    push_unique_pt(preferred_pt_value);
+  }
+  for (int pt : support_video_payload_types_) {
+    push_unique_pt(pt);
+  }
+  if (ordered_video_pts.empty()) {
+    ordered_video_pts = {rtp::PAYLOAD_TYPE::H264, rtp::PAYLOAD_TYPE::AV1};
+  }
+
+  preferred_video_pt = std::to_string(ordered_video_pts.front());
+  for (int pt : ordered_video_pts) {
+    video_capabilities += " " + std::to_string(pt);
   }
   video_capabilities += " " + std::to_string(rtp::PAYLOAD_TYPE::RTX);
   video_capabilities += " 122";
@@ -1213,6 +1220,13 @@ int IceTransport::AppendLocalCapabilitiesToOffer() {
                                         video_abs_recv_time_ext_id_}) +
       BuildVideoTransportAttributes(preferred_video_pt, true, true, true,
                                     true);
+  const std::string rtx_pt = std::to_string(rtp::PAYLOAD_TYPE::RTX);
+  for (size_t i = 1; i < ordered_video_pts.size(); ++i) {
+    const std::string alt_pt = std::to_string(ordered_video_pts[i]);
+    video_ssrc_lines += "a=fmtp:" + rtx_pt + " apt=" + alt_pt + "\n";
+    video_ssrc_lines += "a=rtcp-fb:" + alt_pt + " nack\n";
+    video_ssrc_lines += "a=rtcp-fb:" + alt_pt + " ccm fir\n";
+  }
   std::string audio_ssrc_lines =
       BuildLocalAbsoluteSendTimeExtmap({audio_abs_send_time_ext_id_,
                                         audio_abs_recv_time_ext_id_});
@@ -1639,16 +1653,16 @@ bool IceTransport::NegotiateVideoPayloadType(const std::string& remote_sdp) {
 
   std::size_t prefered_pt_start = 0;
 
-  while (prefered_pt_start <= remote_video_capabilities.length()) {
+  while (prefered_pt_start < remote_video_capabilities.length()) {
     std::size_t prefered_pt_end =
         remote_video_capabilities.find(' ', prefered_pt_start);
     if (prefered_pt_end != std::string::npos) {
-      remote_prefered_video_pt =
-          remote_video_capabilities.substr(0, prefered_pt_end);
+      remote_prefered_video_pt = remote_video_capabilities.substr(
+          prefered_pt_start, prefered_pt_end - prefered_pt_start);
     } else {
-      remote_prefered_video_pt = remote_video_capabilities;
+      remote_prefered_video_pt =
+          remote_video_capabilities.substr(prefered_pt_start);
     }
-
     remote_prefered_video_pt_ =
         (rtp::PAYLOAD_TYPE)(atoi(remote_prefered_video_pt.c_str()));
 
@@ -1699,16 +1713,16 @@ bool IceTransport::NegotiateAudioPayloadType(const std::string& remote_sdp) {
 
   std::size_t prefered_pt_start = 0;
 
-  while (prefered_pt_start <= remote_audio_capabilities.length()) {
+  while (prefered_pt_start < remote_audio_capabilities.length()) {
     std::size_t prefered_pt_end =
         remote_audio_capabilities.find(' ', prefered_pt_start);
     if (prefered_pt_end != std::string::npos) {
-      remote_prefered_audio_pt =
-          remote_audio_capabilities.substr(0, prefered_pt_end);
+      remote_prefered_audio_pt = remote_audio_capabilities.substr(
+          prefered_pt_start, prefered_pt_end - prefered_pt_start);
     } else {
-      remote_prefered_audio_pt = remote_audio_capabilities;
+      remote_prefered_audio_pt =
+          remote_audio_capabilities.substr(prefered_pt_start);
     }
-
     remote_prefered_audio_pt_ =
         (rtp::PAYLOAD_TYPE)(atoi(remote_prefered_audio_pt.c_str()));
 
@@ -1759,16 +1773,16 @@ bool IceTransport::NegotiateDataPayloadType(const std::string& remote_sdp) {
 
   std::size_t prefered_pt_start = 0;
 
-  while (prefered_pt_start <= remote_data_capabilities.length()) {
+  while (prefered_pt_start < remote_data_capabilities.length()) {
     std::size_t prefered_pt_end =
         remote_data_capabilities.find(' ', prefered_pt_start);
     if (prefered_pt_end != std::string::npos) {
-      remote_prefered_data_pt =
-          remote_data_capabilities.substr(0, prefered_pt_end);
+      remote_prefered_data_pt = remote_data_capabilities.substr(
+          prefered_pt_start, prefered_pt_end - prefered_pt_start);
     } else {
-      remote_prefered_data_pt = remote_data_capabilities;
+      remote_prefered_data_pt =
+          remote_data_capabilities.substr(prefered_pt_start);
     }
-
     remote_prefered_data_pt_ =
         (rtp::PAYLOAD_TYPE)(atoi(remote_prefered_data_pt.c_str()));
 
@@ -1929,6 +1943,8 @@ uint8_t IceTransport::CheckIsRtpPacket(const char* buffer, size_t size) {
   if (payload_type == 69 || (payload_type >= 100 && payload_type <= 127 &&
                              payload_type != rtp::PAYLOAD_TYPE::H264 &&
                              payload_type != rtp::PAYLOAD_TYPE::AV1 &&
+                             payload_type != rtp::PAYLOAD_TYPE::HEVC &&
+                             payload_type != rtp::PAYLOAD_TYPE::HEVC - 1 &&
                              payload_type != rtp::PAYLOAD_TYPE::OPUS &&
                              payload_type != rtp::PAYLOAD_TYPE::RTX &&
                              payload_type != rtp::PAYLOAD_TYPE::RS_FEC &&
@@ -1943,6 +1959,7 @@ uint8_t IceTransport::CheckIsRtpPacket(const char* buffer, size_t size) {
 
   if (payload_type == rtp::PAYLOAD_TYPE::H264 ||
       payload_type == rtp::PAYLOAD_TYPE::AV1 ||
+      payload_type == rtp::PAYLOAD_TYPE::HEVC ||
       payload_type == rtp::PAYLOAD_TYPE::OPUS ||
       payload_type == rtp::PAYLOAD_TYPE::RTX ||
       payload_type == rtp::PAYLOAD_TYPE::RS_FEC ||
@@ -1951,6 +1968,7 @@ uint8_t IceTransport::CheckIsRtpPacket(const char* buffer, size_t size) {
     return payload_type;
   } else if (payload_type == rtp::PAYLOAD_TYPE::H264 - 1 ||
              payload_type == rtp::PAYLOAD_TYPE::AV1 - 1 ||
+             payload_type == rtp::PAYLOAD_TYPE::HEVC - 1 ||
              payload_type == rtp::PAYLOAD_TYPE::OPUS - 1) {
     return payload_type;
   } else {
@@ -1989,7 +2007,8 @@ uint8_t IceTransport::CheckIsVideoPacket(const char* buffer, size_t size) {
   uint8_t pt = buffer[1] & 0x7F;
   if (rtp::PAYLOAD_TYPE::H264 == pt || (rtp::PAYLOAD_TYPE::H264 - 1) == pt ||
       rtp::PAYLOAD_TYPE::RS_FEC == pt || rtp::PAYLOAD_TYPE::AV1 == pt ||
-      (rtp::PAYLOAD_TYPE::AV1 - 1) == pt || rtp::PAYLOAD_TYPE::RTX == pt) {
+      (rtp::PAYLOAD_TYPE::AV1 - 1) == pt || rtp::PAYLOAD_TYPE::HEVC == pt ||
+      (rtp::PAYLOAD_TYPE::HEVC - 1) == pt || rtp::PAYLOAD_TYPE::RTX == pt) {
     return pt;
   } else {
     return 0;

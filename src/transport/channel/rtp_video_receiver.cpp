@@ -57,6 +57,30 @@ bool IsH264KeyFrame(const uint8_t* data, size_t size) {
   return false;
 }
 
+bool IsHevcKeyFrame(const uint8_t* data, size_t size) {
+  if (!data) {
+    return false;
+  }
+  for (size_t offset = 0; offset + 3 < size; ++offset) {
+    size_t nal_offset = 0;
+    if (data[offset] == 0 && data[offset + 1] == 0 &&
+        data[offset + 2] == 1) {
+      nal_offset = offset + 3;
+    } else if (offset + 4 < size && data[offset] == 0 &&
+               data[offset + 1] == 0 && data[offset + 2] == 0 &&
+               data[offset + 3] == 1) {
+      nal_offset = offset + 4;
+    }
+    if (nal_offset != 0 && nal_offset + 1 < size) {
+      const uint8_t nal_type = (data[nal_offset] >> 1) & 0x3Fu;
+      if (nal_type == 19 || nal_type == 20 || nal_type == 21) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 }  // namespace
 
 RtpVideoReceiver::RtpVideoReceiver(std::shared_ptr<SystemClock> clock)
@@ -110,6 +134,7 @@ RtpVideoReceiver::~RtpVideoReceiver() {
 
   incomplete_h264_frame_list_.clear();
   incomplete_av1_frame_list_.clear();
+  incomplete_hevc_frame_list_.clear();
   incomplete_frame_list_.clear();
 
   {
@@ -506,6 +531,24 @@ void RtpVideoReceiver::InsertMediaPacket(RtpPacket& rtp_packet,
       std::lock_guard<std::mutex> lock(frame_assembly_mtx_);
       ProcessH264RtpPacket(rtp_packet_h264);
     }
+  } else if (payload_type == rtp::PAYLOAD_TYPE::HEVC) {
+    RtpPacketHevc rtp_packet_hevc;
+    if (!rtp_packet_hevc.Build(media_packet->Buffer().data(),
+                               media_packet->Size()) ||
+        !rtp_packet_hevc.GetFrameHeaderInfo()) {
+      LOG_WARN("Invalid HEVC RTP payload at sequence {}",
+               media_packet->SequenceNumber());
+      RequestKeyFrame();
+      return;
+    }
+#ifdef SAVE_RTP_RECV_STREAM
+    fwrite((unsigned char*)rtp_packet_hevc.Payload(), 1,
+           rtp_packet_hevc.PayloadSize(), file_rtp_recv_);
+#endif
+    {
+      std::lock_guard<std::mutex> lock(frame_assembly_mtx_);
+      ProcessHevcRtpPacket(rtp_packet_hevc);
+    }
   }
 }
 
@@ -546,6 +589,12 @@ void RtpVideoReceiver::ProcessAv1RtpPacket(RtpPacketAv1& rtp_packet_av1) {
         rtp_packet_av1;
     CheckIsAv1FrameCompleted(rtp_packet_av1);
   }
+}
+
+void RtpVideoReceiver::ProcessHevcRtpPacket(RtpPacketHevc& rtp_packet_hevc) {
+  incomplete_hevc_frame_list_[rtp_packet_hevc.SequenceNumber()] =
+      rtp_packet_hevc;
+  CheckIsHevcFrameCompleted(rtp_packet_hevc);
 }
 
 bool RtpVideoReceiver::CheckIsH264FrameCompleted(RtpPacketH264& rtp_packet_h264,
@@ -682,6 +731,69 @@ bool RtpVideoReceiver::CheckIsAv1FrameCompleted(RtpPacketAv1& rtp_packet_av1) {
 
   std::unique_ptr<ReceivedFrame> received_frame =
       CreateReceivedFrame(nv12_data_, complete_frame_size, timestamp);
+
+  ClearFrameMarkers(timestamp);
+  CommitPendingFrame(timestamp, std::move(received_frame), is_keyframe,
+                     end_seq, true);
+  return true;
+}
+
+bool RtpVideoReceiver::CheckIsHevcFrameCompleted(
+    RtpPacketHevc& rtp_packet_hevc) {
+  uint32_t timestamp = rtp_packet_hevc.Timestamp();
+  uint16_t seq = rtp_packet_hevc.SequenceNumber();
+  uint16_t start_seq, end_seq;
+  uint32_t packet_count;
+
+  TrackPendingFramePacket(timestamp, seq);
+
+  if (rtp_packet_hevc.HevcFrameStart()) {
+    fua_start_sequence_numbers_[timestamp] = seq;
+  }
+  if (rtp_packet_hevc.HevcFrameEnd()) {
+    fua_end_sequence_numbers_[timestamp] = seq;
+  }
+
+  if (!GetFrameSequenceRange(timestamp, "HEVC", &start_seq, &end_seq,
+                             &packet_count)) {
+    return false;
+  }
+
+  for (uint32_t offset = 0; offset < packet_count; ++offset) {
+    const uint16_t sequence_number = SequenceNumberAt(start_seq, offset);
+    auto packet_it = incomplete_hevc_frame_list_.find(sequence_number);
+    if (packet_it == incomplete_hevc_frame_list_.end() ||
+        packet_it->second.Timestamp() != timestamp) {
+      return false;
+    }
+  }
+
+  const bool header_keyframe =
+      incomplete_hevc_frame_list_.find(start_seq)->second.IsKeyFrame();
+  size_t complete_frame_size = 0;
+  for (uint32_t offset = 0; offset < packet_count; ++offset) {
+    const uint16_t s = SequenceNumberAt(start_seq, offset);
+    complete_frame_size +=
+        incomplete_hevc_frame_list_.find(s)->second.PayloadSize();
+  }
+
+  EnsureFrameBufferCapacity(complete_frame_size);
+
+  uint8_t* dest = nv12_data_;
+  for (uint32_t offset = 0; offset < packet_count; ++offset) {
+    const uint16_t s = SequenceNumberAt(start_seq, offset);
+    auto packet_it = incomplete_hevc_frame_list_.find(s);
+    const size_t payload_size = packet_it->second.PayloadSize();
+    memcpy(dest, packet_it->second.Payload(), payload_size);
+    dest += payload_size;
+    incomplete_hevc_frame_list_.erase(packet_it);
+  }
+
+  std::unique_ptr<ReceivedFrame> received_frame =
+      CreateReceivedFrame(nv12_data_, complete_frame_size, timestamp);
+  const bool is_keyframe =
+      header_keyframe ||
+      IsHevcKeyFrame(received_frame->Buffer(), received_frame->Size());
 
   ClearFrameMarkers(timestamp);
   CommitPendingFrame(timestamp, std::move(received_frame), is_keyframe,
@@ -978,6 +1090,14 @@ void RtpVideoReceiver::DropFrameAssembly(uint32_t timestamp) {
        it != incomplete_av1_frame_list_.end();) {
     if (it->second.Timestamp() == timestamp) {
       it = incomplete_av1_frame_list_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  for (auto it = incomplete_hevc_frame_list_.begin();
+       it != incomplete_hevc_frame_list_.end();) {
+    if (it->second.Timestamp() == timestamp) {
+      it = incomplete_hevc_frame_list_.erase(it);
     } else {
       ++it;
     }

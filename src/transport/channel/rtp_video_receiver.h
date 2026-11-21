@@ -32,6 +32,7 @@
 #include "rtp_fec.h"
 #include "rtp_packet_av1.h"
 #include "rtp_packet_h264.h"
+#include "rtp_packet_hevc.h"
 #include "rtp_rtcp_defines.h"
 #include "rtp_timestamp.h"
 #include "sender_report.h"
@@ -95,6 +96,8 @@ class RtpVideoReceiver : public ThreadBase {
   void InsertMediaPacket(RtpPacket& packet, bool fec_recovered = false);
   void ProcessAv1RtpPacket(RtpPacketAv1& rtp_packet_av1);
   bool CheckIsAv1FrameCompleted(RtpPacketAv1& rtp_packet_av1);
+  void ProcessHevcRtpPacket(RtpPacketHevc& rtp_packet_hevc);
+  bool CheckIsHevcFrameCompleted(RtpPacketHevc& rtp_packet_hevc);
 
  private:
   void ProcessH264RtpPacket(RtpPacketH264& rtp_packet_h264);
@@ -157,6 +160,7 @@ class RtpVideoReceiver : public ThreadBase {
  private:
   std::map<uint16_t, RtpPacketH264> incomplete_h264_frame_list_;
   std::map<uint16_t, RtpPacketAv1> incomplete_av1_frame_list_;
+  std::map<uint16_t, RtpPacketHevc> incomplete_hevc_frame_list_;
   std::map<uint16_t, RtpPacket> incomplete_frame_list_;
   uint8_t* nv12_data_ = nullptr;
   size_t frame_buffer_capacity_ = 0;

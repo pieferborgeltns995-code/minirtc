@@ -223,6 +223,17 @@ int PeerConnection::Init(PeerConnectionParams params) {
     native_video_output_ =
         cfg_native_video_output_ == "true" ? true : false;
     av1_encoding_ = cfg_av1_encoding_ == "true" ? true : false;
+    const std::string cfg_video_codec =
+        reader.Get("video codec", "codec", "");
+    if (cfg_video_codec == "hevc" || cfg_video_codec == "h265") {
+      video_codec_ = MiniRtcVideoCodecHEVC;
+    } else if (cfg_video_codec == "av1") {
+      video_codec_ = MiniRtcVideoCodecAV1;
+    } else if (cfg_video_codec == "h264") {
+      video_codec_ = MiniRtcVideoCodecH264;
+    } else {
+      video_codec_ = av1_encoding_ ? MiniRtcVideoCodecAV1 : MiniRtcVideoCodecH264;
+    }
     turn_mode_ = ParseTurnMode(cfg_turn_mode_, cfg_enable_turn_ == "true");
     enable_srtp_ = cfg_enable_srtp_ == "true" ? true : false;
     video_content_type_ = ParseVideoContentType(cfg_video_content_type_);
@@ -243,6 +254,10 @@ int PeerConnection::Init(PeerConnectionParams params) {
     hardware_acceleration_ = params.hardware_acceleration;
     native_video_output_ = params.native_video_output;
     av1_encoding_ = params.av1_encoding;
+    video_codec_ = params.video_codec != MiniRtcVideoCodecDefault
+                       ? params.video_codec
+                       : (av1_encoding_ ? MiniRtcVideoCodecAV1
+                                        : MiniRtcVideoCodecH264);
     if (IsValidTurnMode(params.turn_mode)) {
       turn_mode_ = params.turn_mode;
     } else {
@@ -282,6 +297,7 @@ int PeerConnection::Init(PeerConnectionParams params) {
   connection_info_.enable_srtp = enable_srtp_;
   connection_info_.video_content_type = video_content_type_;
   connection_info_.av1_encoding = av1_encoding_;
+  connection_info_.video_codec = video_codec_;
   connection_info_.video_quality = video_quality_;
   connection_info_.video_frame_rate = video_frame_rate_;
   connection_info_.video_degradation_preference =
@@ -296,7 +312,10 @@ int PeerConnection::Init(PeerConnectionParams params) {
            hardware_acceleration_ ? "ON" : "OFF");
   LOG_INFO("Native video output [{}]",
            native_video_output_ ? "ON" : "OFF");
-  LOG_INFO("Video format [{}]", av1_encoding_ ? "AV1" : "H.264");
+  LOG_INFO("Video format [{}]",
+           video_codec_ == MiniRtcVideoCodecHEVC
+               ? "HEVC"
+               : (video_codec_ == MiniRtcVideoCodecAV1 ? "AV1" : "H.264"));
   LOG_INFO("Video frame rate [{} fps]", video_frame_rate_);
   LOG_INFO("Video degradation preference [{}]",
            VideoDegradationPreferenceToString(
@@ -418,10 +437,26 @@ int PeerConnection::Init(PeerConnectionParams params) {
 int PeerConnection::UpdateConnectionSettings(bool hardware_acceleration,
                                               bool av1_encoding,
                                               MiniRtcTurnMode turn_mode) {
+  return UpdateConnectionSettings(
+      hardware_acceleration,
+      av1_encoding ? MiniRtcVideoCodecAV1 : MiniRtcVideoCodecH264, turn_mode);
+}
+
+int PeerConnection::UpdateConnectionSettings(bool hardware_acceleration,
+                                              MiniRtcVideoCodec video_codec,
+                                              MiniRtcTurnMode turn_mode) {
   if (!IsValidTurnMode(turn_mode)) return -1;
+  const MiniRtcVideoCodec resolved =
+      video_codec == MiniRtcVideoCodecDefault ? MiniRtcVideoCodecH264
+                                              : video_codec;
+  if (resolved != MiniRtcVideoCodecH264 && resolved != MiniRtcVideoCodecAV1 &&
+      resolved != MiniRtcVideoCodecHEVC) {
+    return -1;
+  }
   std::lock_guard lock(connection_info_mutex_);
   connection_info_.hardware_acceleration = hardware_acceleration;
-  connection_info_.av1_encoding = av1_encoding;
+  connection_info_.av1_encoding = (resolved == MiniRtcVideoCodecAV1);
+  connection_info_.video_codec = resolved;
   connection_info_.turn_mode = turn_mode;
   return 0;
 }

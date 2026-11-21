@@ -50,6 +50,7 @@ using EncodedAudioCallback =
 enum class VideoCodecType : uint8_t {
   H264 = 0,
   AV1 = 1,
+  HEVC = 2,
 };
 
 class MediaCodecConfig {

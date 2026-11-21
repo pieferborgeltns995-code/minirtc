@@ -46,6 +46,7 @@ MiniRtcPeerPtr* MiniRtcCreatePeer(const MiniRtcParams* params) {
     peer_ptr->pc_params.hardware_acceleration = params->hardware_acceleration;
     peer_ptr->pc_params.native_video_output = params->native_video_output;
     peer_ptr->pc_params.av1_encoding = params->av1_encoding;
+    peer_ptr->pc_params.video_codec = params->video_codec;
     peer_ptr->pc_params.turn_mode = params->turn_mode;
     peer_ptr->pc_params.enable_srtp = params->enable_srtp;
     peer_ptr->pc_params.video_content_type = params->video_content_type;
@@ -149,6 +150,17 @@ int MiniRtcUpdateConnectionSettings(MiniRtcPeerPtr* peer_ptr,
   }
   return peer_ptr->peer_connection->UpdateConnectionSettings(
       hardware_acceleration, av1_encoding, turn_mode);
+}
+
+int MiniRtcUpdateConnectionSettingsEx(MiniRtcPeerPtr* peer_ptr,
+                                      bool hardware_acceleration,
+                                      MiniRtcVideoCodec video_codec,
+                                      MiniRtcTurnMode turn_mode) {
+  if (!peer_ptr || !peer_ptr->peer_connection) {
+    return -1;
+  }
+  return peer_ptr->peer_connection->UpdateConnectionSettings(
+      hardware_acceleration, video_codec, turn_mode);
 }
 
 int MiniRtcLeaveConnection(MiniRtcPeerPtr* peer_ptr,

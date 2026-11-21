@@ -110,6 +110,9 @@ struct Nalu {
 };
 std::vector<Nalu> AnnexBNalus(const uint8_t* data, size_t size);
 bool HasNalu(const uint8_t* data, size_t size, uint8_t type);
+std::vector<Nalu> AnnexBHevcNalus(const uint8_t* data, size_t size);
+bool HasHevcNalu(const uint8_t* data, size_t size, uint8_t type);
+bool IsHevcKeyFrame(const uint8_t* data, size_t size);
 
 }  // namespace minirtc::wmf
 #endif

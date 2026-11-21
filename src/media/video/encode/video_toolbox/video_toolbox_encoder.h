@@ -21,9 +21,12 @@ namespace minirtc {
 
 class VideoToolboxEncoder : public MediaCodec {
  public:
-  explicit VideoToolboxEncoder(std::shared_ptr<SystemClock> clock);
+  explicit VideoToolboxEncoder(
+      std::shared_ptr<SystemClock> clock,
+      VideoCodecType codec_type = VideoCodecType::H264);
   virtual ~VideoToolboxEncoder();
 
+  static bool IsHevcSupported();
   int Init(const MediaCodecConfig& config) override;
 
   int Encode(const RawFrame& raw_frame,

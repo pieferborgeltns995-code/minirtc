@@ -1,4 +1,5 @@
 #include "video_toolbox_encoder.h"
+#import <CoreMedia/CoreMedia.h>
 #import <CoreVideo/CoreVideo.h>
 #import <Foundation/Foundation.h>
 #import <VideoToolbox/VideoToolbox.h>
@@ -22,7 +23,7 @@ using namespace std;
 
 class VideoToolboxEncoder::Impl {
  public:
-  Impl(std::shared_ptr<SystemClock> clock);
+  Impl(std::shared_ptr<SystemClock> clock, VideoCodecType codec_type);
   ~Impl();
 
   int Init(const MediaCodecConfig& config);
@@ -32,7 +33,10 @@ class VideoToolboxEncoder::Impl {
   int SetTargetFrameRate(int frame_rate);
   int SetPrioritizeEncodingSpeedOverQuality(bool prioritize_speed);
   int GetResolution(int* width, int* height);
-  std::string GetEncoderName() { return "VideoToolbox (H.264)"; }
+  std::string GetEncoderName() const {
+    return codec_type_ == VideoCodecType::HEVC ? "VideoToolbox (HEVC)"
+                                               : "VideoToolbox (H.264)";
+  }
 
  private:
   struct FrameCallbackContext {
@@ -62,6 +66,7 @@ class VideoToolboxEncoder::Impl {
 
  private:
   std::shared_ptr<SystemClock> clock_;
+  VideoCodecType codec_type_ = VideoCodecType::H264;
   int width_ = 2880;
   int height_ = 1800;
   int max_fps_ = 60;
@@ -105,7 +110,9 @@ class VideoToolboxEncoder::Impl {
 
 #pragma mark - Impl 实现
 
-VideoToolboxEncoder::Impl::Impl(std::shared_ptr<SystemClock> clock) : clock_(clock) {}
+VideoToolboxEncoder::Impl::Impl(std::shared_ptr<SystemClock> clock,
+                                VideoCodecType codec_type)
+    : clock_(clock), codec_type_(codec_type) {}
 
 VideoToolboxEncoder::Impl::~Impl() {
 #ifdef SAVE_RECEIVED_NV12_STREAM
@@ -209,9 +216,12 @@ int VideoToolboxEncoder::Impl::CreateCompressionSession(int width, int height,
       kCFBooleanTrue);
 #endif
 
+  const CMVideoCodecType vt_codec =
+      codec_type_ == VideoCodecType::HEVC ? kCMVideoCodecType_HEVC
+                                          : kCMVideoCodecType_H264;
   VTCompressionSessionRef new_session = nullptr;
   OSStatus status =
-      VTCompressionSessionCreate(nullptr, width, height, kCMVideoCodecType_H264, encoder_spec,
+      VTCompressionSessionCreate(nullptr, width, height, vt_codec, encoder_spec,
                                  nullptr, nullptr, CompressionOutputCallback, this, &new_session);
   CFRelease(encoder_spec);
   if (status != noErr || new_session == nullptr) {
@@ -227,9 +237,13 @@ int VideoToolboxEncoder::Impl::CreateCompressionSession(int width, int height,
                        kCFBooleanFalse);
   VTSessionSetProperty(new_session, kVTCompressionPropertyKey_AllowFrameReordering,
                        kCFBooleanFalse);
-  VTSessionSetProperty(new_session, kVTCompressionPropertyKey_ProfileLevel,
-                       kVTProfileLevel_H264_High_5_2);
-
+  if (codec_type_ == VideoCodecType::HEVC) {
+    VTSessionSetProperty(new_session, kVTCompressionPropertyKey_ProfileLevel,
+                         kVTProfileLevel_HEVC_Main_AutoLevel);
+  } else {
+    VTSessionSetProperty(new_session, kVTCompressionPropertyKey_ProfileLevel,
+                         kVTProfileLevel_H264_High_5_2);
+  }
   CFNumberRef frameIntervalRef = CFNumberCreate(nullptr, kCFNumberIntType, &keyframe_interval_);
   VTSessionSetProperty(new_session, kVTCompressionPropertyKey_MaxKeyFrameInterval,
                        frameIntervalRef);
@@ -750,26 +764,49 @@ void VideoToolboxEncoder::Impl::HandleEncodedSampleBuffer(
   CFDictionaryRef dict = (CFDictionaryRef)CFArrayGetValueAtIndex(attachments, 0);
   bool isKeyframe = !CFDictionaryContainsKey(dict, kCMSampleAttachmentKey_NotSync);
 
-  std::vector<uint8_t> sps;
-  std::vector<uint8_t> pps;
+  std::vector<std::vector<uint8_t>> parameter_sets;
   if (isKeyframe) {
-    const uint8_t* sps_data = nullptr;
-    const uint8_t* pps_data = nullptr;
-    size_t sps_size = 0;
-    size_t pps_size = 0;
-    size_t sps_count = 0;
-    size_t pps_count = 0;
-    OSStatus sps_status = CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
-        formatDesc, 0, &sps_data, &sps_size, &sps_count, nullptr);
-    OSStatus pps_status = CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
-        formatDesc, 1, &pps_data, &pps_size, &pps_count, nullptr);
-    if (sps_status != noErr || pps_status != noErr || !sps_data || !pps_data || sps_size == 0 ||
-        pps_size == 0) {
-      LOG_ERROR("Failed to get VideoToolbox SPS/PPS: sps={}, pps={}", sps_status, pps_status);
-      return;
+    if (codec_type_ == VideoCodecType::HEVC) {
+      size_t param_count = 0;
+      OSStatus count_status = CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(
+          formatDesc, 0, nullptr, nullptr, &param_count, nullptr);
+      if (count_status != noErr || param_count < 3) {
+        LOG_ERROR("Failed to query VideoToolbox HEVC parameter sets: status={}, count={}",
+                  count_status, param_count);
+        return;
+      }
+      parameter_sets.reserve(param_count);
+      for (size_t idx = 0; idx < param_count; ++idx) {
+        const uint8_t* ps_data = nullptr;
+        size_t ps_size = 0;
+        OSStatus ps_status = CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(
+            formatDesc, idx, &ps_data, &ps_size, nullptr, nullptr);
+        if (ps_status != noErr || !ps_data || ps_size == 0) {
+          LOG_ERROR("Failed to get VideoToolbox HEVC parameter set {}: status={}",
+                    idx, ps_status);
+          return;
+        }
+        parameter_sets.emplace_back(ps_data, ps_data + ps_size);
+      }
+    } else {
+      const uint8_t* sps_data = nullptr;
+      const uint8_t* pps_data = nullptr;
+      size_t sps_size = 0;
+      size_t pps_size = 0;
+      size_t sps_count = 0;
+      size_t pps_count = 0;
+      OSStatus sps_status = CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
+          formatDesc, 0, &sps_data, &sps_size, &sps_count, nullptr);
+      OSStatus pps_status = CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
+          formatDesc, 1, &pps_data, &pps_size, &pps_count, nullptr);
+      if (sps_status != noErr || pps_status != noErr || !sps_data || !pps_data || sps_size == 0 ||
+          pps_size == 0) {
+        LOG_ERROR("Failed to get VideoToolbox SPS/PPS: sps={}, pps={}", sps_status, pps_status);
+        return;
+      }
+      parameter_sets.emplace_back(sps_data, sps_data + sps_size);
+      parameter_sets.emplace_back(pps_data, pps_data + pps_size);
     }
-    sps.assign(sps_data, sps_data + sps_size);
-    pps.assign(pps_data, pps_data + pps_size);
   }
 
   CMBlockBufferRef dataBuffer = CMSampleBufferGetDataBuffer(sampleBuffer);
@@ -792,10 +829,10 @@ void VideoToolboxEncoder::Impl::HandleEncodedSampleBuffer(
   size_t offset = 0;
 
   if (isKeyframe) {
-    annexBData.insert(annexBData.end(), startCode, startCode + 4);
-    annexBData.insert(annexBData.end(), sps.begin(), sps.end());
-    annexBData.insert(annexBData.end(), startCode, startCode + 4);
-    annexBData.insert(annexBData.end(), pps.begin(), pps.end());
+    for (const auto& ps : parameter_sets) {
+      annexBData.insert(annexBData.end(), startCode, startCode + 4);
+      annexBData.insert(annexBData.end(), ps.begin(), ps.end());
+    }
   }
 
   while (offset + 4 <= totalLength) {
@@ -826,7 +863,7 @@ void VideoToolboxEncoder::Impl::HandleEncodedSampleBuffer(
   frame.SetCapturedTimestamp(CMSampleBufferGetOutputPresentationTimeStamp(sampleBuffer).value);
   frame.SetEncodedTimestamp(clock_->CurrentTime());
 
-  {
+  if (codec_type_ == VideoCodecType::H264) {
     lock_guard<mutex> parser_guard(h264_parser_lock_);
     const uint64_t current_generation = session_generation_.load();
     if (context.generation == current_generation &&
@@ -850,10 +887,33 @@ void VideoToolboxEncoder::Impl::HandleEncodedSampleBuffer(
 
 //
 
-VideoToolboxEncoder::VideoToolboxEncoder(std::shared_ptr<SystemClock> clock)
-    : impl_(new Impl(clock)) {}
+VideoToolboxEncoder::VideoToolboxEncoder(std::shared_ptr<SystemClock> clock,
+                                         VideoCodecType codec_type)
+    : impl_(new Impl(clock, codec_type)) {}
 
 VideoToolboxEncoder::~VideoToolboxEncoder() = default;
+
+bool VideoToolboxEncoder::IsHevcSupported() {
+#if TARGET_OS_IOS
+  return false;
+#else
+  CFDictionaryRef supported = nullptr;
+  CFMutableDictionaryRef spec = CFDictionaryCreateMutable(
+      nullptr, 1, &kCFTypeDictionaryKeyCallBacks,
+      &kCFTypeDictionaryValueCallBacks);
+  if (spec) {
+    CFDictionarySetValue(
+        spec,
+        kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder,
+        kCFBooleanTrue);
+  }
+  OSStatus status = VTCopySupportedPropertyDictionaryForEncoder(
+      1920, 1080, kCMVideoCodecType_HEVC, spec, nullptr, &supported);
+  if (spec) CFRelease(spec);
+  if (supported) CFRelease(supported);
+  return status == noErr;
+#endif
+}
 
 int VideoToolboxEncoder::Init(const MediaCodecConfig& config) { return impl_->Init(config); }
 

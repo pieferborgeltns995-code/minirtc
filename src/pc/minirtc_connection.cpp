@@ -4,10 +4,39 @@
 
 #include "log.h"
 #include "nlohmann/json.hpp"
+#include "video_decoder_factory.h"
+#include "video_encoder_factory.h"
 
 namespace minirtc {
 
 using nlohmann::json;
+
+namespace {
+rtp::PAYLOAD_TYPE PreferredVideoPayloadType(const ConnectionInfo& info) {
+  if (info.video_codec == MiniRtcVideoCodecHEVC) {
+    return rtp::PAYLOAD_TYPE::HEVC;
+  }
+  if (info.video_codec == MiniRtcVideoCodecAV1) {
+    return rtp::PAYLOAD_TYPE::AV1;
+  }
+  if (info.video_codec == MiniRtcVideoCodecH264) {
+    return rtp::PAYLOAD_TYPE::H264;
+  }
+  return info.av1_encoding ? rtp::PAYLOAD_TYPE::AV1 : rtp::PAYLOAD_TYPE::H264;
+}
+
+std::vector<int> BuildSupportedVideoPayloadTypes(const ConnectionInfo& info) {
+  std::vector<int> pts = {rtp::PAYLOAD_TYPE::H264, rtp::PAYLOAD_TYPE::AV1};
+  if (info.hardware_acceleration &&
+      VideoEncoderFactory::CheckIsHardwareAccelerationSupported(
+          VideoCodecType::HEVC) &&
+      VideoDecoderFactory::CheckIsHardwareAccelerationSupported(
+          VideoCodecType::HEVC)) {
+    pts.push_back(rtp::PAYLOAD_TYPE::HEVC);
+  }
+  return pts;
+}
+}  // namespace
 
 MiniRtcConnection::MiniRtcConnection(std::shared_ptr<SystemClock> clock,
                                      std::shared_ptr<SignalSender> ws,
@@ -243,13 +272,14 @@ void MiniRtcConnection::ProcessIceWorkMsg(const IceWorkMsg& msg) {
           clock_, true, transmission_id, info_.user_id, remote_user_id, ws_,
           on_ice_status_change_, callbacks_.user_data);
 
+      video_payload_types_ = BuildSupportedVideoPayloadTypes(info_);
       ice_transport_->SetLocalCapabilities(
           info_.hardware_acceleration, info_.native_video_output,
           info_.trickle_ice, info_.reliable_ice, info_.turn_mode,
           info_.enable_srtp,
           info_.video_content_type, info_.video_quality,
           info_.video_frame_rate, info_.video_degradation_preference,
-          info_.av1_encoding ? rtp::PAYLOAD_TYPE::AV1 : rtp::PAYLOAD_TYPE::H264,
+          PreferredVideoPayloadType(info_),
           video_payload_types_, audio_payload_types_);
 
       ice_transport_->SetOnReceiveFunc(callbacks_.on_receive_video_frame,
@@ -309,13 +339,14 @@ void MiniRtcConnection::ProcessIceWorkMsg(const IceWorkMsg& msg) {
           clock_, false, transmission_id, info_.user_id, remote_user_id, ws_,
           on_ice_status_change_, callbacks_.user_data);
 
+      video_payload_types_ = BuildSupportedVideoPayloadTypes(info_);
       ice_transport_->SetLocalCapabilities(
           info_.hardware_acceleration, info_.native_video_output,
           info_.trickle_ice, info_.reliable_ice, info_.turn_mode,
           info_.enable_srtp,
           info_.video_content_type, info_.video_quality,
           info_.video_frame_rate, info_.video_degradation_preference,
-          info_.av1_encoding ? rtp::PAYLOAD_TYPE::AV1 : rtp::PAYLOAD_TYPE::H264,
+          PreferredVideoPayloadType(info_),
           video_payload_types_, audio_payload_types_);
 
       ice_transport_->SetOnReceiveFunc(callbacks_.on_receive_video_frame,
