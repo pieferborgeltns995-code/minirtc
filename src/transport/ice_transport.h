@@ -120,6 +120,8 @@ class IceTransport {
 
   int SetRemoteSdp(const std::string& remote_sdp);
 
+  bool IsExpectedRemoteAnswer(const std::string& remote_sdp) const;
+
   int AddRemoteCandidate(const std::string& candidate_sdp,
                          const std::string& candidate_ufrag = "");
 

@@ -950,7 +950,24 @@ int IceTransport::GatherCandidates() {
   return ret;
 }
 
+bool IceTransport::IsExpectedRemoteAnswer(const std::string& remote_sdp) const {
+  if (!offer_peer_ || local_ice_username_.empty()) {
+    return true;
+  }
+  const auto echoed_offer_ufrag = GetOfferUfragAttribute(remote_sdp);
+  if (!echoed_offer_ufrag.has_value()) {
+    return true;
+  }
+  return *echoed_offer_ufrag == local_ice_username_;
+}
+
 int IceTransport::SetRemoteSdp(const std::string& remote_sdp) {
+  if (!IsExpectedRemoteAnswer(remote_sdp)) {
+    const auto echoed_offer_ufrag = GetOfferUfragAttribute(remote_sdp);
+    LOG_WARN("Ignoring stale answer for superseded ICE offer (expected={}, got={})",
+             local_ice_username_, echoed_offer_ufrag.value_or(""));
+    return -1;
+  }
   const std::string remote_ufrag = GetIceUsername(remote_sdp);
   if (remote_ufrag.empty()) {
     LOG_ERROR("Remote SDP has no ICE username fragment");
@@ -981,6 +998,7 @@ int IceTransport::SetRemoteSdp(const std::string& remote_sdp) {
     media_stream_sdp += "\r\n" + std::string(kSrtpKeyLayoutAttribute) + "\r\n";
   }
   media_stream_sdp = PreserveUdpPunchCapability(remote_sdp, media_stream_sdp);
+  media_stream_sdp = StripOfferUfragAttribute(media_stream_sdp);
   if (ice_agent_->SetRemoteSdp(media_stream_sdp.c_str()) != 0) {
     return -1;
   }
@@ -1078,6 +1096,9 @@ int IceTransport::SendOffer() {
     local_sdp_ = ice_agent_->AppendFingerprintLine(local_sdp_);
   }
   AppendAudioDataSrtpCapability();
+  if (!local_ice_username_.empty()) {
+    local_sdp_ += std::string(kOfferUfragAttribute) + local_ice_username_ + "\r\n";
+  }
   if (direct_policy_.enabled() &&
       !ValidateDirectSdp(local_sdp_, direct_policy_.local_address)) {
     if (direct_error_) direct_error_(MiniRtcDirectNetworkPolicyFailed);
@@ -1106,6 +1127,10 @@ int IceTransport::SendAnswer() {
     local_sdp_ = ice_agent_->AppendFingerprintLine(local_sdp_);
   }
   AppendAudioDataSrtpCapability();
+  if (!remote_ice_username_.empty()) {
+    local_sdp_ +=
+        std::string(kOfferUfragAttribute) + remote_ice_username_ + "\r\n";
+  }
   if (direct_policy_.enabled() &&
       !ValidateDirectSdp(local_sdp_, direct_policy_.local_address)) {
     if (direct_error_) direct_error_(MiniRtcDirectNetworkPolicyFailed);

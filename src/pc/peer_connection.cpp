@@ -1308,12 +1308,15 @@ void PeerConnection::ProcessSignal(const std::string& signal) {
                                 remote_user_id.size(), user_data_);
           break;
         }
-        if (!ReplaceOrCreatePeerConnection(remote_user_id, "join", info)) break;
+        auto connection = ReplaceOrCreatePeerConnection(remote_user_id, "join", info);
+        if (!connection) break;
 
         IceWorkMsg msg;
         msg.type = IceWorkMsg::Type::UserJoinTransmission;
         msg.transmission_id = transmission_id;
         msg.remote_user_id = remote_user_id;
+        msg.has_target_connection = true;
+        msg.target_connection = connection;
         PushIceWorkMsg(msg);
       }
 
@@ -1348,14 +1351,17 @@ void PeerConnection::ProcessSignal(const std::string& signal) {
                                 remote_user_id.size(), user_data_);
           break;
         }
-        if (!ReplaceOrCreatePeerConnection(remote_user_id, "offer", info))
-          break;
+        auto connection =
+            ReplaceOrCreatePeerConnection(remote_user_id, "offer", info);
+        if (!connection) break;
 
         IceWorkMsg msg;
         msg.type = IceWorkMsg::Type::Offer;
         msg.transmission_id = transmission_id;
         msg.remote_user_id = remote_user_id;
         msg.remote_sdp = remote_sdp;
+        msg.has_target_connection = true;
+        msg.target_connection = connection;
         PushIceWorkMsg(msg);
         on_connection_status_(MiniRtcConnectionStatus::MiniRtcConnectionConnecting,
                               remote_user_id.data(), remote_user_id.size(),
@@ -1375,11 +1381,21 @@ void PeerConnection::ProcessSignal(const std::string& signal) {
         std::string remote_sdp = j["sdp"].get<std::string>();
         LOG_INFO("Received remote answer");
 
+        std::shared_ptr<ConnectionInterface> target;
+        {
+          std::shared_lock lock(peer_connection_map_mutex_);
+          auto it = peer_connection_map_.find(remote_user_id);
+          if (it != peer_connection_map_.end()) {
+            target = it->second;
+          }
+        }
         IceWorkMsg msg;
         msg.type = IceWorkMsg::Type::Answer;
         msg.transmission_id = transmission_id;
         msg.remote_user_id = remote_user_id;
         msg.remote_sdp = remote_sdp;
+        msg.has_target_connection = true;
+        msg.target_connection = target;
         PushIceWorkMsg(msg);
         on_connection_status_(MiniRtcConnectionStatus::MiniRtcConnectionConnecting,
                               remote_user_id.data(), remote_user_id.size(),
@@ -1580,6 +1596,12 @@ void PeerConnection::ProcessIceWorkMsg(const IceWorkMsg& msg) {
       }
     }
     if (connection) {
+      if (msg.has_target_connection &&
+          msg.target_connection.lock() != connection) {
+        LOG_WARN("Ignoring stale ICE work msg type={} for superseded peer",
+                 static_cast<int>(msg.type));
+        return;
+      }
       try {
         connection->ProcessIceWorkMsg(msg);
         return;

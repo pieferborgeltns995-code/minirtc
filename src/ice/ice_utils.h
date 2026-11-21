@@ -36,6 +36,9 @@ inline constexpr char kUdpPunchRetryAttribute[] =
 // SRTP from peers that use the standard fingerprint as their media switch.
 inline constexpr char kUdpPunchFingerprintAttribute[] =
     "a=x-minirtc-udp-punch-fingerprint:";
+// Echoed by the answerer so the offerer can discard stale answers from a
+// superseded ICE generation before feeding mismatched credentials to libnice.
+inline constexpr char kOfferUfragAttribute[] = "a=x-minirtc-offer-ufrag:";
 
 // The entire SDP is the authority. Duplicates and unknown versions disable
 // this extension, including a conflicting declaration in a discarded section.
@@ -140,6 +143,45 @@ inline std::string GetIceUsername(const std::string& sdp) {
     }
   }
   return {};
+}
+
+// Returns the echoed offer ufrag when present cleanly once; returns std::nullopt
+// if absent or malformed/duplicated so legacy peers still negotiate normally.
+inline std::optional<std::string> GetOfferUfragAttribute(
+    const std::string& sdp) {
+  const std::string_view prefix(kOfferUfragAttribute);
+  std::istringstream lines(sdp);
+  std::string line;
+  std::optional<std::string> value;
+  while (std::getline(lines, line)) {
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    if (line.rfind(prefix.data(), 0) == 0) {
+      std::string parsed = TrimIceWhitespace(line.substr(prefix.size()));
+      if (parsed.empty() || parsed.size() > 256 ||
+          parsed.find_first_of(" \t\r\n") != std::string::npos) {
+        return std::nullopt;
+      }
+      if (value.has_value() && *value != parsed) {
+        return std::nullopt;
+      }
+      value = std::move(parsed);
+    }
+  }
+  return value;
+}
+
+inline std::string StripOfferUfragAttribute(const std::string& sdp) {
+  if (sdp.find(kOfferUfragAttribute) == std::string::npos) return sdp;
+  const std::string_view prefix(kOfferUfragAttribute);
+  std::istringstream lines(sdp);
+  std::string line, result;
+  while (std::getline(lines, line)) {
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    if (line.rfind(prefix.data(), 0) != 0) {
+      result += line + "\n";
+    }
+  }
+  return result;
 }
 
 struct IceFingerprintSdp {

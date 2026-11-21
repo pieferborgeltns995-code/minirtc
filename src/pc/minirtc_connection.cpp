@@ -400,6 +400,10 @@ void MiniRtcConnection::ProcessIceWorkMsg(const IceWorkMsg& msg) {
       std::string remote_sdp = msg.remote_sdp;
 
       if (ice_transport_) {
+        if (!ice_transport_->IsExpectedRemoteAnswer(remote_sdp)) {
+          LOG_WARN("Ignoring stale remote answer for superseded offer");
+          break;
+        }
         int ret = ice_transport_->SetRemoteSdp(remote_sdp);
         if (0 != ret) {
           LOG_ERROR("Set remote sdp failed");

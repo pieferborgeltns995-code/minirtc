@@ -9,6 +9,7 @@
 
 #include <functional>
 #include <map>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -65,6 +66,8 @@ struct ConnectionCallbacks {
   MiniRtcOnReceiveEncodedVideo on_receive_encoded_video = nullptr;
 };
 
+class ConnectionInterface;
+
 struct IceWorkMsg {
   enum Type {
     Login = 0,
@@ -87,6 +90,8 @@ struct IceWorkMsg {
   std::string candidate;
   std::string mid;
   std::string remote_sdp;
+  bool has_target_connection = false;
+  std::weak_ptr<ConnectionInterface> target_connection;
 };
 
 class ConnectionInterface {
