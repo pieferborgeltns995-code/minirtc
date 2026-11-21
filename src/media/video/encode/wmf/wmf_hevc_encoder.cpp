@@ -781,18 +781,23 @@ class WmfHevcEncoder::Impl {
         *std::max_element(stat_total_ms_.begin(), stat_total_ms_.end());
     const double sub_p50 = Percentile(stat_submit_ms_, 0.50);
     const double sub_p95 = Percentile(stat_submit_ms_, 0.95);
+    const double sub_max =
+        *std::max_element(stat_submit_ms_.begin(), stat_submit_ms_.end());
     const double hw_p50 = Percentile(stat_hw_ms_, 0.50);
     const double hw_p95 = Percentile(stat_hw_ms_, 0.95);
+    const double hw_max =
+        *std::max_element(stat_hw_ms_.begin(), stat_hw_ms_.end());
     const double avg_kb = static_cast<double>(stat_total_bytes_) /
                           (static_cast<double>(n) * 1024.0);
     LOG_INFO(
         "WMF HEVC stats ({:.1f}s): {}x{} d3d11={} frames={} fps={:.1f} kf={} "
         "enc_ms[p50={:.2f} p95={:.2f} max={:.2f}] "
-        "submit_ms[p50={:.2f} p95={:.2f}] hw_ms[p50={:.2f} p95={:.2f}] "
+        "submit_ms[p50={:.2f} p95={:.2f} max={:.2f}] "
+        "hw_ms[p50={:.2f} p95={:.2f} max={:.2f}] "
         "avg_kb={:.1f}",
         elapsed_s, source_width_, source_height_, using_d3d11_, n,
         static_cast<double>(n) / elapsed_s, stat_keyframes_, enc_p50, enc_p95,
-        enc_max, sub_p50, sub_p95, hw_p50, hw_p95, avg_kb);
+        enc_max, sub_p50, sub_p95, sub_max, hw_p50, hw_p95, hw_max, avg_kb);
     stat_window_start_ = now;
     stat_total_ms_.clear();
     stat_submit_ms_.clear();

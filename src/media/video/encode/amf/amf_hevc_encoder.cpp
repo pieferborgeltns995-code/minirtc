@@ -8,15 +8,19 @@
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
+#include <mutex>
 #include <thread>
+#include <utility>
 #include <vector>
-
 #include "components/Component.h"
 #include "components/ComponentCaps.h"
 #include "components/VideoEncoderHEVC.h"
@@ -138,20 +142,28 @@ class EncodeStatsTracker {
         *std::max_element(total_ms_.begin(), total_ms_.end());
     const double wait_p50 = Percentile(wait_ms_, 0.50);
     const double wait_p95 = Percentile(wait_ms_, 0.95);
+    const double wait_max =
+        *std::max_element(wait_ms_.begin(), wait_ms_.end());
     const double in_p50 = Percentile(input_ms_, 0.50);
     const double in_p95 = Percentile(input_ms_, 0.95);
+    const double in_max =
+        *std::max_element(input_ms_.begin(), input_ms_.end());
     const double hw_p50 = Percentile(hw_ms_, 0.50);
     const double hw_p95 = Percentile(hw_ms_, 0.95);
+    const double hw_max =
+        *std::max_element(hw_ms_.begin(), hw_ms_.end());
     const double avg_kb = static_cast<double>(total_bytes_) /
                           (static_cast<double>(n) * 1024.0);
     LOG_INFO(
         "{} stats ({:.1f}s): {}x{} d3d11={} frames={} fps={:.1f} kf={} "
         "enc_ms[p50={:.2f} p95={:.2f} max={:.2f}] "
-        "wait_ms[p50={:.2f} p95={:.2f}] input_ms[p50={:.2f} p95={:.2f}] "
-        "hw_ms[p50={:.2f} p95={:.2f}] avg_kb={:.1f}",
+        "wait_ms[p50={:.2f} p95={:.2f} max={:.2f}] "
+        "input_ms[p50={:.2f} p95={:.2f} max={:.2f}] "
+        "hw_ms[p50={:.2f} p95={:.2f} max={:.2f}] avg_kb={:.1f}",
         encoder_tag, elapsed_s, encode_width, encode_height, using_d3d11, n,
         static_cast<double>(n) / elapsed_s, keyframes_, enc_p50, enc_p95,
-        enc_max, wait_p50, wait_p95, in_p50, in_p95, hw_p50, hw_p95, avg_kb);
+        enc_max, wait_p50, wait_p95, wait_max, in_p50, in_p95, in_max, hw_p50,
+        hw_p95, hw_max, avg_kb);
     window_start_ = now;
     total_ms_.clear();
     wait_ms_.clear();
@@ -358,15 +370,156 @@ class AmfHevcEncoder::Impl {
   explicit Impl(std::shared_ptr<SystemClock> clock)
       : clock_(std::move(clock)) {}
 
+  static constexpr size_t kMaxInFlightFrames = 2;
+
+  struct InFlightFrame {
+    NativeVideoFrameRef retained_native;
+    int64_t captured_ts = 0;
+    std::chrono::steady_clock::time_point encode_start{};
+    std::chrono::steady_clock::time_point encode_submitted{};
+    double wait_poll_ms = 0.0;
+    double input_ms = 0.0;
+    std::function<int(const EncodedFrame&)> callback;
+  };
+
   ~Impl() {
-    callback_worker_.Flush();
     worker_.Call([this] {
       Reset(true);
       fallback_.reset();
     });
+    callback_worker_.Flush();
+  }
+
+  void StartOutputThread() {
+    StopOutputThread(false);
+    {
+      std::lock_guard<std::mutex> lock(in_flight_mutex_);
+      output_stop_ = false;
+      in_flight_.clear();
+    }
+    async_error_.store(AMF_OK, std::memory_order_release);
+    output_thread_ = std::thread([this] { OutputLoop(); });
+  }
+
+  void StopOutputThread(bool drain) {
+    if (output_thread_.joinable()) {
+      if (drain) {
+        std::unique_lock<std::mutex> lock(in_flight_mutex_);
+        in_flight_cv_.wait_for(
+            lock, std::chrono::milliseconds(500), [this] {
+              return in_flight_.empty() ||
+                     async_error_.load(std::memory_order_acquire) != AMF_OK;
+            });
+      }
+      {
+        std::lock_guard<std::mutex> lock(in_flight_mutex_);
+        output_stop_ = true;
+      }
+      in_flight_cv_.notify_all();
+      output_thread_.join();
+    }
+    std::lock_guard<std::mutex> lock(in_flight_mutex_);
+    in_flight_.clear();
+    output_stop_ = false;
+  }
+  void OutputLoop() {
+    while (true) {
+      std::chrono::steady_clock::time_point oldest_submitted{};
+      {
+        std::unique_lock<std::mutex> lock(in_flight_mutex_);
+        in_flight_cv_.wait(lock, [this] {
+          return !in_flight_.empty() || output_stop_;
+        });
+        if (output_stop_) {
+          break;
+        }
+        oldest_submitted = in_flight_.front().encode_submitted;
+      }
+
+      amf::AMFDataPtr out_data;
+      const auto q_start = std::chrono::steady_clock::now();
+      const AMF_RESULT res = encoder_->QueryOutput(&out_data);
+      const auto q_end = std::chrono::steady_clock::now();
+      const double q_ms =
+          std::chrono::duration<double, std::milli>(q_end - q_start).count();
+
+      if (res == AMF_OK && out_data) {
+        InFlightFrame item;
+        bool have_item = false;
+        {
+          std::lock_guard<std::mutex> lock(in_flight_mutex_);
+          if (!in_flight_.empty()) {
+            item = std::move(in_flight_.front());
+            in_flight_.pop_front();
+            have_item = true;
+          }
+        }
+        in_flight_cv_.notify_all();
+        if (!have_item) {
+          continue;
+        }
+
+        amf::AMFBufferPtr out_buf(out_data);
+        std::vector<EncodedFrame> frames;
+        const AMF_RESULT read_res =
+            ReadOutputBuffer(out_buf, item.captured_ts, frames);
+        item.retained_native.Reset();
+        if (read_res != AMF_OK) {
+          async_error_.store(read_res, std::memory_order_release);
+          in_flight_cv_.notify_all();
+          break;
+        }
+
+        const auto encode_end = std::chrono::steady_clock::now();
+        const double total_ms =
+            std::chrono::duration<double, std::milli>(encode_end -
+                                                      item.encode_start)
+                .count();
+        const double hw_ms =
+            std::chrono::duration<double, std::milli>(encode_end -
+                                                      item.encode_submitted)
+                .count();
+        const size_t encoded_bytes =
+            frames.empty() ? 0 : frames.back().Size();
+        const bool is_key =
+            !frames.empty() &&
+            frames.back().FrameType() == VideoFrameType::kVideoFrameKey;
+        stats_.Record("AMF HEVC", encode_end, source_width_, source_height_,
+                      using_d3d11_, total_ms, item.wait_poll_ms, item.input_ms,
+                      hw_ms, encoded_bytes, is_key);
+        if (!frames.empty() && item.callback) {
+          callback_worker_.Post(
+              [frames = std::move(frames),
+               cb = std::move(item.callback)]() mutable {
+                for (const auto& frame : frames) {
+                  cb(frame);
+                }
+              });
+        }
+        continue;
+      }
+
+      if (res == AMF_REPEAT) {
+        if (q_end - oldest_submitted > std::chrono::seconds(2)) {
+          async_error_.store(AMF_FAIL, std::memory_order_release);
+          in_flight_cv_.notify_all();
+          break;
+        }
+        if (q_ms < 0.5) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        continue;
+      }
+
+      async_error_.store(res != AMF_OK ? res : AMF_FAIL,
+                         std::memory_order_release);
+      in_flight_cv_.notify_all();
+      break;
+    }
   }
 
   void Reset(bool unload_dll = false) {
+    StopOutputThread(/*drain=*/!unload_dll && encoder_ != nullptr);
     if (encoder_) {
       encoder_->Terminate();
       encoder_ = nullptr;
@@ -395,6 +548,7 @@ class AmfHevcEncoder::Impl {
     pps_.clear();
     sequence_ = 0;
     force_idr_ = true;
+    async_error_.store(AMF_OK, std::memory_order_release);
     stats_.Reset();
   }
 
@@ -583,7 +737,7 @@ class AmfHevcEncoder::Impl {
     SetOptionalProp(encoder_, AMF_VIDEO_ENCODER_HEVC_INPUT_QUEUE_SIZE,
                     "INPUT_QUEUE_SIZE", static_cast<amf_int64>(4));
     SetOptionalProp(encoder_, AMF_VIDEO_ENCODER_HEVC_QUERY_TIMEOUT,
-                    "QUERY_TIMEOUT", static_cast<amf_int64>(50));
+                    "QUERY_TIMEOUT", static_cast<amf_int64>(20));
 
     ApplyRateControlProperties(true);
 
@@ -658,6 +812,7 @@ class AmfHevcEncoder::Impl {
         using_d3d11_ ? "D3D11 zero-copy" : "CPU surface", source_width_,
         source_height_, config_.init_bitrate, config_.max_frame_rate);
     reconfigure_ = false;
+    StartOutputThread();
     return AMF_OK;
   }
 
@@ -766,7 +921,7 @@ class AmfHevcEncoder::Impl {
     return AMF_OK;
   }
 
-  AMF_RESULT ReadOutputBuffer(amf::AMFBuffer* out_buf, const RawFrame& raw,
+  AMF_RESULT ReadOutputBuffer(amf::AMFBuffer* out_buf, int64_t captured_ts,
                               std::vector<EncodedFrame>& frames) {
     if (!out_buf || !out_buf->GetNative() || out_buf->GetSize() == 0) {
       return AMF_FAIL;
@@ -836,17 +991,18 @@ class AmfHevcEncoder::Impl {
     frame.SetEncodedWidth(out_w);
     frame.SetEncodedHeight(out_h);
     frame.SetFrameType(key ? kVideoFrameKey : kVideoFrameDelta);
-    frame.SetCapturedTimestamp(raw.CapturedTimestamp());
+    frame.SetCapturedTimestamp(captured_ts);
     frame.SetEncodedTimestamp(clock_->CurrentTime());
     frames.push_back(std::move(frame));
-    if (key) {
-      force_idr_ = false;
-    }
     return AMF_OK;
   }
 
   AMF_RESULT EncodeHardware(const RawFrame& raw,
-                            std::vector<EncodedFrame>& frames) {
+                            std::function<int(const EncodedFrame&)>& callback) {
+    const AMF_RESULT prev_err = async_error_.load(std::memory_order_acquire);
+    if (prev_err != AMF_OK && !reconfigure_) {
+      return prev_err;
+    }
     const auto encode_start = std::chrono::steady_clock::now();
     auto encode_submitted = encode_start;
     double submit_ms = 0.0;
@@ -883,6 +1039,7 @@ class AmfHevcEncoder::Impl {
               reconfigure_, source_width_, source_height_, raw.Width(),
               raw.Height());
         }
+        StopOutputThread(/*drain=*/true);
         source_width_ = static_cast<int>(raw.Width());
         source_height_ = static_cast<int>(raw.Height());
         config_.init_width = source_width_;
@@ -906,6 +1063,7 @@ class AmfHevcEncoder::Impl {
               size_changed, switched_cpu, reconfigure_, source_width_,
               source_height_, raw.Width(), raw.Height());
         }
+        StopOutputThread(/*drain=*/true);
         source_width_ = static_cast<int>(raw.Width());
         source_height_ = static_cast<int>(raw.Height());
         config_.init_width = source_width_;
@@ -917,11 +1075,44 @@ class AmfHevcEncoder::Impl {
 
     if (!encoder_) return AMF_NOT_INITIALIZED;
 
+    const bool using_crop_copy =
+        is_d3d11_input && using_d3d11_ &&
+        (native->payload.d3d11_nv12.subresource_index != 0 ||
+         ((static_cast<int>(native->payload.d3d11_nv12.texture_width) !=
+               source_width_ ||
+           static_cast<int>(native->payload.d3d11_nv12.texture_height) !=
+               source_height_) &&
+          need_d3d11_crop_copy_));
+    // The crop-copy fallback reuses a single intermediate texture, so drain
+    // in-flight work before overwriting it; zero-copy D3D11 and CPU paths run
+    // up to kMaxInFlightFrames concurrently.
+    const size_t max_in_flight = using_crop_copy ? 0 : (kMaxInFlightFrames - 1);
+    const auto wait_start = std::chrono::steady_clock::now();
+    {
+      std::unique_lock<std::mutex> lock(in_flight_mutex_);
+      const bool slot_ready = in_flight_cv_.wait_for(
+          lock, std::chrono::seconds(2), [this, max_in_flight] {
+            return in_flight_.size() <= max_in_flight ||
+                   async_error_.load(std::memory_order_acquire) != AMF_OK;
+          });
+      const AMF_RESULT err = async_error_.load(std::memory_order_acquire);
+      if (err != AMF_OK) return err;
+      if (!slot_ready) return AMF_FAIL;
+    }
+    wait_poll_ms += std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - wait_start)
+                        .count();
+
     bool tex_larger_than_visible = false;
     amf::AMFSurfacePtr surface;
+    const auto prep_start = std::chrono::steady_clock::now();
     AMF_RESULT res = PrepareInputSurface(
         raw, is_d3d11_input, &tex_larger_than_visible, surface);
+    const auto prep_end = std::chrono::steady_clock::now();
     if (res != AMF_OK) return res;
+    const double prep_ms =
+        std::chrono::duration<double, std::milli>(prep_end - prep_start)
+            .count();
 
     const amf_pts duration = 10'000'000LL / config_.max_frame_rate;
     surface->SetPts(next_time_);
@@ -931,7 +1122,8 @@ class AmfHevcEncoder::Impl {
     if (sequence_ % static_cast<uint64_t>(config_.key_frame_interval) == 0) {
       force_idr_ = true;
     }
-    if (force_idr_) {
+    const bool requested_key = force_idr_;
+    if (requested_key) {
       SetOptionalProp(
           surface, AMF_VIDEO_ENCODER_HEVC_FORCE_PICTURE_TYPE,
           "FORCE_PICTURE_TYPE",
@@ -943,82 +1135,69 @@ class AmfHevcEncoder::Impl {
       }
     }
 
+    NativeVideoFrameRef retained_native;
+    if (is_d3d11_input && using_d3d11_ && !using_crop_copy &&
+        !need_d3d11_crop_copy_) {
+      retained_native = NativeVideoFrameRef(raw.NativeFrame());
+    }
+
     const auto deadline =
         std::chrono::steady_clock::now() + std::chrono::seconds(2);
-    bool submitted = false;
     while (std::chrono::steady_clock::now() < deadline) {
-      if (!submitted) {
-        const auto sub_start = std::chrono::steady_clock::now();
-        res = encoder_->SubmitInput(surface);
-        const auto sub_end = std::chrono::steady_clock::now();
-        submit_ms +=
-            std::chrono::duration<double, std::milli>(sub_end - sub_start)
-                .count();
-        if (res == AMF_OK || res == AMF_NEED_MORE_INPUT) {
-          submitted = true;
-          encode_submitted = sub_end;
-          surface = nullptr;
-        } else if (res != AMF_INPUT_FULL) {
-          if (is_d3d11_input && using_d3d11_ && tex_larger_than_visible &&
-              !need_d3d11_crop_copy_) {
-            LOG_WARN(
-                "AMD AMF HEVC SubmitInput rejected padded D3D11 texture "
-                "(res={}); switching to GPU exact-size crop copy",
-                static_cast<int>(res));
-            need_d3d11_crop_copy_ = true;
-          }
-          return res;
+      const AMF_RESULT err = async_error_.load(std::memory_order_acquire);
+      if (err != AMF_OK) return err;
+
+      const auto sub_start = std::chrono::steady_clock::now();
+      res = encoder_->SubmitInput(surface);
+      const auto sub_end = std::chrono::steady_clock::now();
+      submit_ms +=
+          std::chrono::duration<double, std::milli>(sub_end - sub_start)
+              .count();
+      if (res == AMF_OK || res == AMF_NEED_MORE_INPUT) {
+        encode_submitted = sub_end;
+        surface = nullptr;
+        if (requested_key) {
+          force_idr_ = false;
         }
-      }
-
-      amf::AMFDataPtr out_data;
-      const auto q_start = std::chrono::steady_clock::now();
-      res = encoder_->QueryOutput(&out_data);
-      const auto q_end = std::chrono::steady_clock::now();
-      const double q_ms =
-          std::chrono::duration<double, std::milli>(q_end - q_start).count();
-      if (!submitted) {
-        wait_poll_ms += q_ms;
-      }
-
-      if (res == AMF_OK && out_data) {
-        amf::AMFBufferPtr out_buf(out_data);
-        res = ReadOutputBuffer(out_buf, raw, frames);
-        if (res != AMF_OK) return res;
         ++sequence_;
-        if (submitted) {
-          const auto encode_end = std::chrono::steady_clock::now();
-          const double total_ms =
-              std::chrono::duration<double, std::milli>(encode_end -
-                                                        encode_start)
-                  .count();
-          const double hw_ms =
-              std::chrono::duration<double, std::milli>(encode_end -
-                                                        encode_submitted)
-                  .count();
-          const size_t encoded_bytes =
-              frames.empty() ? 0 : frames.back().Size();
-          const bool is_key =
-              !frames.empty() &&
-              frames.back().FrameType() == VideoFrameType::kVideoFrameKey;
-          stats_.Record("AMF HEVC", encode_end, source_width_, source_height_,
-                        using_d3d11_, total_ms, wait_poll_ms, submit_ms, hw_ms,
-                        encoded_bytes, is_key);
-          return AMF_OK;
+        {
+          std::lock_guard<std::mutex> lock(in_flight_mutex_);
+          in_flight_.push_back(InFlightFrame{
+              std::move(retained_native), raw.CapturedTimestamp(), encode_start,
+              encode_submitted, wait_poll_ms, prep_ms + submit_ms,
+              std::move(callback)});
         }
+        in_flight_cv_.notify_one();
+        return AMF_OK;
       }
-      if (res != AMF_REPEAT && res != AMF_OK) {
+      if (res != AMF_INPUT_FULL) {
+        if (is_d3d11_input && using_d3d11_ && tex_larger_than_visible &&
+            !need_d3d11_crop_copy_) {
+          LOG_WARN(
+              "AMD AMF HEVC SubmitInput rejected padded D3D11 texture "
+              "(res={}); switching to GPU exact-size crop copy",
+              static_cast<int>(res));
+          need_d3d11_crop_copy_ = true;
+        }
         return res;
       }
-      if (!submitted || q_ms < 0.5) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-      }
+      const auto sleep_start = std::chrono::steady_clock::now();
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      wait_poll_ms += std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - sleep_start)
+                          .count();
     }
     return AMF_FAIL;
   }
 
   wmf::CodecThread worker_;
   wmf::CallbackThread callback_worker_;
+  std::thread output_thread_;
+  std::mutex in_flight_mutex_;
+  std::condition_variable in_flight_cv_;
+  std::deque<InFlightFrame> in_flight_;
+  bool output_stop_ = false;
+  std::atomic<AMF_RESULT> async_error_{AMF_OK};
   std::shared_ptr<SystemClock> clock_;
   MediaCodecConfig config_;
   HMODULE amf_dll_ = nullptr;
@@ -1063,8 +1242,8 @@ bool AmfHevcEncoder::IsSupported() {
 
 int AmfHevcEncoder::Init(const MediaCodecConfig& config) {
   if (!ValidConfig(config)) return -1;
-  impl_->callback_worker_.Flush();
-  return impl_->worker_.Call([&] {
+  const int ret = impl_->worker_.Call([&] {
+    impl_->StopOutputThread(/*drain=*/false);
     impl_->fallback_.reset();
     impl_->config_ = config;
     impl_->config_.init_bitrate =
@@ -1080,6 +1259,8 @@ int AmfHevcEncoder::Init(const MediaCodecConfig& config) {
         (impl_->Initialize(nullptr, 0, 0) == AMF_OK);
     return impl_->initialized_ ? 0 : -1;
   });
+  impl_->callback_worker_.Flush();
+  return ret;
 }
 
 bool AmfHevcEncoder::SupportsNativeFrameInput(
@@ -1098,16 +1279,22 @@ int AmfHevcEncoder::Encode(const RawFrame& raw,
     return -1;
   }
   std::vector<EncodedFrame> frames;
+  bool delivered_async = false;
   const int result = impl_->worker_.Call([&] {
     if (!impl_->initialized_) return -1;
     if (!impl_->fallback_) {
-      AMF_RESULT res = impl_->EncodeHardware(raw, frames);
-      if (res == AMF_OK) return 0;
+      AMF_RESULT res = impl_->EncodeHardware(raw, callback);
+      if (res == AMF_OK) {
+        delivered_async = true;
+        return 0;
+      }
       if (impl_->using_d3d11_) {
         if (impl_->need_d3d11_crop_copy_) {
-          frames.clear();
-          res = impl_->EncodeHardware(raw, frames);
-          if (res == AMF_OK) return 0;
+          res = impl_->EncodeHardware(raw, callback);
+          if (res == AMF_OK) {
+            delivered_async = true;
+            return 0;
+          }
         }
         LOG_WARN(
             "AMD AMF HEVC D3D11 encoding failed (res={}); retrying with AMF "
@@ -1115,9 +1302,11 @@ int AmfHevcEncoder::Encode(const RawFrame& raw,
             static_cast<int>(res));
         impl_->d3d11_failed_device_ = impl_->d3d_device_.Get();
         impl_->reconfigure_ = true;
-        frames.clear();
-        res = impl_->EncodeHardware(raw, frames);
-        if (res == AMF_OK) return 0;
+        res = impl_->EncodeHardware(raw, callback);
+        if (res == AMF_OK) {
+          delivered_async = true;
+          return 0;
+        }
       }
       LOG_WARN(
           "AMD AMF hardware HEVC encoding failed ({}); falling back to WMF "
@@ -1147,7 +1336,7 @@ int AmfHevcEncoder::Encode(const RawFrame& raw,
           return 0;
         });
   });
-  if (result == 0 && !frames.empty() && callback) {
+  if (result == 0 && !delivered_async && !frames.empty() && callback) {
     impl_->callback_worker_.Post(
         [frames = std::move(frames), cb = std::move(callback)]() mutable {
           for (const auto& frame : frames) {

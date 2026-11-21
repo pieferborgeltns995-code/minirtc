@@ -7,15 +7,19 @@
 #include <d3d11.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
+#include <mutex>
 #include <thread>
+#include <utility>
 #include <vector>
-
 #include "av1_encode_helpers.h"
 #include "avt/svt_av1_encoder.h"
 #include "components/Component.h"
@@ -151,15 +155,156 @@ class AmfAv1Encoder::Impl {
   explicit Impl(std::shared_ptr<SystemClock> clock)
       : clock_(std::move(clock)) {}
 
+  static constexpr size_t kMaxInFlightFrames = 2;
+
+  struct InFlightFrame {
+    NativeVideoFrameRef retained_native;
+    int64_t captured_ts = 0;
+    std::chrono::steady_clock::time_point encode_start{};
+    std::chrono::steady_clock::time_point encode_submitted{};
+    double wait_poll_ms = 0.0;
+    double input_ms = 0.0;
+    std::function<int(const EncodedFrame&)> callback;
+  };
+
   ~Impl() {
-    callback_worker_.Flush();
     worker_.Call([this] {
       Reset(true);
       fallback_.reset();
     });
+    callback_worker_.Flush();
+  }
+
+  void StartOutputThread() {
+    StopOutputThread(false);
+    {
+      std::lock_guard<std::mutex> lock(in_flight_mutex_);
+      output_stop_ = false;
+      in_flight_.clear();
+    }
+    async_error_.store(AMF_OK, std::memory_order_release);
+    output_thread_ = std::thread([this] { OutputLoop(); });
+  }
+
+  void StopOutputThread(bool drain) {
+    if (output_thread_.joinable()) {
+      if (drain) {
+        std::unique_lock<std::mutex> lock(in_flight_mutex_);
+        in_flight_cv_.wait_for(
+            lock, std::chrono::milliseconds(500), [this] {
+              return in_flight_.empty() ||
+                     async_error_.load(std::memory_order_acquire) != AMF_OK;
+            });
+      }
+      {
+        std::lock_guard<std::mutex> lock(in_flight_mutex_);
+        output_stop_ = true;
+      }
+      in_flight_cv_.notify_all();
+      output_thread_.join();
+    }
+    std::lock_guard<std::mutex> lock(in_flight_mutex_);
+    in_flight_.clear();
+    output_stop_ = false;
+  }
+  void OutputLoop() {
+    while (true) {
+      std::chrono::steady_clock::time_point oldest_submitted{};
+      {
+        std::unique_lock<std::mutex> lock(in_flight_mutex_);
+        in_flight_cv_.wait(lock, [this] {
+          return !in_flight_.empty() || output_stop_;
+        });
+        if (output_stop_) {
+          break;
+        }
+        oldest_submitted = in_flight_.front().encode_submitted;
+      }
+
+      amf::AMFDataPtr out_data;
+      const auto q_start = std::chrono::steady_clock::now();
+      const AMF_RESULT res = encoder_->QueryOutput(&out_data);
+      const auto q_end = std::chrono::steady_clock::now();
+      const double q_ms =
+          std::chrono::duration<double, std::milli>(q_end - q_start).count();
+
+      if (res == AMF_OK && out_data) {
+        InFlightFrame item;
+        bool have_item = false;
+        {
+          std::lock_guard<std::mutex> lock(in_flight_mutex_);
+          if (!in_flight_.empty()) {
+            item = std::move(in_flight_.front());
+            in_flight_.pop_front();
+            have_item = true;
+          }
+        }
+        in_flight_cv_.notify_all();
+        if (!have_item) {
+          continue;
+        }
+
+        amf::AMFBufferPtr out_buf(out_data);
+        std::vector<EncodedFrame> frames;
+        const AMF_RESULT read_res =
+            ReadOutputBuffer(out_buf, item.captured_ts, frames);
+        item.retained_native.Reset();
+        if (read_res != AMF_OK) {
+          async_error_.store(read_res, std::memory_order_release);
+          in_flight_cv_.notify_all();
+          break;
+        }
+
+        const auto encode_end = std::chrono::steady_clock::now();
+        const double total_ms =
+            std::chrono::duration<double, std::milli>(encode_end -
+                                                      item.encode_start)
+                .count();
+        const double hw_ms =
+            std::chrono::duration<double, std::milli>(encode_end -
+                                                      item.encode_submitted)
+                .count();
+        const size_t encoded_bytes =
+            frames.empty() ? 0 : frames.back().Size();
+        const bool is_key =
+            !frames.empty() &&
+            frames.back().FrameType() == VideoFrameType::kVideoFrameKey;
+        stats_.Record("AMF AV1", encode_end, encode_width_, encode_height_,
+                      using_d3d11_, total_ms, item.wait_poll_ms, item.input_ms,
+                      hw_ms, encoded_bytes, is_key);
+        if (!frames.empty() && item.callback) {
+          callback_worker_.Post(
+              [frames = std::move(frames),
+               cb = std::move(item.callback)]() mutable {
+                for (const auto& frame : frames) {
+                  cb(frame);
+                }
+              });
+        }
+        continue;
+      }
+
+      if (res == AMF_REPEAT) {
+        if (q_end - oldest_submitted > std::chrono::seconds(2)) {
+          async_error_.store(AMF_FAIL, std::memory_order_release);
+          in_flight_cv_.notify_all();
+          break;
+        }
+        if (q_ms < 0.5) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        continue;
+      }
+
+      async_error_.store(res != AMF_OK ? res : AMF_FAIL,
+                         std::memory_order_release);
+      in_flight_cv_.notify_all();
+      break;
+    }
   }
 
   void Reset(bool unload_dll = false) {
+    StopOutputThread(/*drain=*/!unload_dll && encoder_ != nullptr);
     if (encoder_) {
       encoder_->Terminate();
       encoder_ = nullptr;
@@ -182,6 +327,7 @@ class AmfAv1Encoder::Impl {
     sequence_header_.clear();
     sequence_ = 0;
     force_idr_ = true;
+    async_error_.store(AMF_OK, std::memory_order_release);
     stats_.Reset();
   }
 
@@ -322,8 +468,7 @@ class AmfAv1Encoder::Impl {
     SetOptionalProp(encoder_, AMF_VIDEO_ENCODER_AV1_INPUT_QUEUE_SIZE,
                     "INPUT_QUEUE_SIZE", static_cast<amf_int64>(4));
     SetOptionalProp(encoder_, AMF_VIDEO_ENCODER_AV1_QUERY_TIMEOUT,
-                    "QUERY_TIMEOUT", static_cast<amf_int64>(50));
-
+                    "QUERY_TIMEOUT", static_cast<amf_int64>(20));
     ApplyRateControlProperties(true);
 
     res = encoder_->Init(amf::AMF_SURFACE_NV12, width, height);
@@ -416,6 +561,7 @@ class AmfAv1Encoder::Impl {
                source_height_, encode_width_, encode_height_);
     }
     reconfigure_ = false;
+    StartOutputThread();
     return AMF_OK;
   }
 
@@ -464,7 +610,7 @@ class AmfAv1Encoder::Impl {
     return AMF_OK;
   }
 
-  AMF_RESULT ReadOutputBuffer(amf::AMFBuffer* out_buf, const RawFrame& raw,
+  AMF_RESULT ReadOutputBuffer(amf::AMFBuffer* out_buf, int64_t captured_ts,
                               std::vector<EncodedFrame>& frames) {
     if (!out_buf || !out_buf->GetNative() || out_buf->GetSize() == 0) {
       return AMF_FAIL;
@@ -493,15 +639,16 @@ class AmfAv1Encoder::Impl {
     const uint32_t out_w = static_cast<uint32_t>(VisibleWidth());
     const uint32_t out_h = static_cast<uint32_t>(VisibleHeight());
     PushEncodedAv1Frame(output_bytes_, out_w, out_h, processed.is_keyframe,
-                        raw.CapturedTimestamp(), clock_->CurrentTime(), frames);
-    if (processed.is_keyframe) {
-      force_idr_ = false;
-    }
+                        captured_ts, clock_->CurrentTime(), frames);
     return AMF_OK;
   }
 
   AMF_RESULT EncodeHardware(const RawFrame& raw,
-                            std::vector<EncodedFrame>& frames) {
+                            std::function<int(const EncodedFrame&)>& callback) {
+    const AMF_RESULT prev_err = async_error_.load(std::memory_order_acquire);
+    if (prev_err != AMF_OK) {
+      return prev_err;
+    }
     const auto encode_start = std::chrono::steady_clock::now();
     auto encode_submitted = encode_start;
     double submit_ms = 0.0;
@@ -537,6 +684,7 @@ class AmfAv1Encoder::Impl {
               reconfigure_, source_width_, source_height_, raw.Width(),
               raw.Height());
         }
+        StopOutputThread(/*drain=*/true);
         source_width_ = static_cast<int>(raw.Width());
         source_height_ = static_cast<int>(raw.Height());
         config_.init_width = source_width_;
@@ -556,6 +704,7 @@ class AmfAv1Encoder::Impl {
               size_changed, switched_cpu, reconfigure_, source_width_,
               source_height_, raw.Width(), raw.Height());
         }
+        StopOutputThread(/*drain=*/true);
         source_width_ = static_cast<int>(raw.Width());
         source_height_ = static_cast<int>(raw.Height());
         config_.init_width = source_width_;
@@ -567,9 +716,30 @@ class AmfAv1Encoder::Impl {
 
     if (!encoder_) return AMF_NOT_INITIALIZED;
 
+    const auto wait_start = std::chrono::steady_clock::now();
+    {
+      std::unique_lock<std::mutex> lock(in_flight_mutex_);
+      const bool slot_ready = in_flight_cv_.wait_for(
+          lock, std::chrono::seconds(2), [this] {
+            return in_flight_.size() < kMaxInFlightFrames ||
+                   async_error_.load(std::memory_order_acquire) != AMF_OK;
+          });
+      const AMF_RESULT err = async_error_.load(std::memory_order_acquire);
+      if (err != AMF_OK) return err;
+      if (!slot_ready) return AMF_FAIL;
+    }
+    wait_poll_ms += std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - wait_start)
+                        .count();
+
     amf::AMFSurfacePtr surface;
+    const auto prep_start = std::chrono::steady_clock::now();
     AMF_RESULT res = PrepareInputSurface(raw, is_d3d11_input, surface);
+    const auto prep_end = std::chrono::steady_clock::now();
     if (res != AMF_OK) return res;
+    const double prep_ms =
+        std::chrono::duration<double, std::milli>(prep_end - prep_start)
+            .count();
 
     const amf_pts duration = 10'000'000LL / config_.max_frame_rate;
     surface->SetPts(next_time_);
@@ -579,7 +749,8 @@ class AmfAv1Encoder::Impl {
     if (sequence_ % config_.key_frame_interval == 0) {
       force_idr_ = true;
     }
-    if (force_idr_) {
+    const bool requested_key = force_idr_;
+    if (requested_key) {
       SetOptionalProp(
           surface, AMF_VIDEO_ENCODER_AV1_FORCE_FRAME_TYPE, "FORCE_FRAME_TYPE",
           static_cast<amf_int64>(AMF_VIDEO_ENCODER_AV1_FORCE_FRAME_TYPE_KEY));
@@ -588,74 +759,60 @@ class AmfAv1Encoder::Impl {
                       "FORCE_INSERT_SEQUENCE_HEADER", true);
     }
 
+    NativeVideoFrameRef retained_native;
+    if (is_d3d11_input && using_d3d11_) {
+      retained_native = NativeVideoFrameRef(raw.NativeFrame());
+    }
+
     const auto deadline =
         std::chrono::steady_clock::now() + std::chrono::seconds(2);
-    bool submitted = false;
     while (std::chrono::steady_clock::now() < deadline) {
-      if (!submitted) {
-        const auto sub_start = std::chrono::steady_clock::now();
-        res = encoder_->SubmitInput(surface);
-        const auto sub_end = std::chrono::steady_clock::now();
-        submit_ms +=
-            std::chrono::duration<double, std::milli>(sub_end - sub_start)
-                .count();
-        if (res == AMF_OK || res == AMF_NEED_MORE_INPUT) {
-          submitted = true;
-          encode_submitted = sub_end;
-          surface = nullptr;
-        } else if (res != AMF_INPUT_FULL) {
-          return res;
+      const AMF_RESULT err = async_error_.load(std::memory_order_acquire);
+      if (err != AMF_OK) return err;
+
+      const auto sub_start = std::chrono::steady_clock::now();
+      res = encoder_->SubmitInput(surface);
+      const auto sub_end = std::chrono::steady_clock::now();
+      submit_ms +=
+          std::chrono::duration<double, std::milli>(sub_end - sub_start)
+              .count();
+      if (res == AMF_OK || res == AMF_NEED_MORE_INPUT) {
+        encode_submitted = sub_end;
+        surface = nullptr;
+        if (requested_key) {
+          force_idr_ = false;
         }
-      }
-
-      amf::AMFDataPtr out_data;
-      const auto q_start = std::chrono::steady_clock::now();
-      res = encoder_->QueryOutput(&out_data);
-      const auto q_end = std::chrono::steady_clock::now();
-      const double q_ms =
-          std::chrono::duration<double, std::milli>(q_end - q_start).count();
-      if (!submitted) {
-        wait_poll_ms += q_ms;
-      }
-
-      if (res == AMF_OK && out_data) {
-        amf::AMFBufferPtr out_buf(out_data);
-        res = ReadOutputBuffer(out_buf, raw, frames);
-        if (res != AMF_OK) return res;
         ++sequence_;
-        if (submitted) {
-          const auto encode_end = std::chrono::steady_clock::now();
-          const double total_ms =
-              std::chrono::duration<double, std::milli>(encode_end -
-                                                        encode_start)
-                  .count();
-          const double hw_ms =
-              std::chrono::duration<double, std::milli>(encode_end -
-                                                        encode_submitted)
-                  .count();
-          const size_t encoded_bytes =
-              frames.empty() ? 0 : frames.back().Size();
-          const bool is_key =
-              !frames.empty() &&
-              frames.back().FrameType() == VideoFrameType::kVideoFrameKey;
-          stats_.Record("AMF AV1", encode_end, encode_width_, encode_height_,
-                        using_d3d11_, total_ms, wait_poll_ms, submit_ms, hw_ms,
-                        encoded_bytes, is_key);
-          return AMF_OK;
+        {
+          std::lock_guard<std::mutex> lock(in_flight_mutex_);
+          in_flight_.push_back(InFlightFrame{
+              std::move(retained_native), raw.CapturedTimestamp(), encode_start,
+              encode_submitted, wait_poll_ms, prep_ms + submit_ms,
+              std::move(callback)});
         }
+        in_flight_cv_.notify_one();
+        return AMF_OK;
       }
-      if (res != AMF_REPEAT && res != AMF_OK) {
+      if (res != AMF_INPUT_FULL) {
         return res;
       }
-      if (!submitted || q_ms < 0.5) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-      }
+      const auto sleep_start = std::chrono::steady_clock::now();
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      wait_poll_ms += std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - sleep_start)
+                          .count();
     }
     return AMF_FAIL;
   }
 
   wmf::CodecThread worker_;
   wmf::CallbackThread callback_worker_;
+  std::thread output_thread_;
+  std::mutex in_flight_mutex_;
+  std::condition_variable in_flight_cv_;
+  std::deque<InFlightFrame> in_flight_;
+  bool output_stop_ = false;
+  std::atomic<AMF_RESULT> async_error_{AMF_OK};
   std::shared_ptr<SystemClock> clock_;
   MediaCodecConfig config_;
   HMODULE amf_dll_ = nullptr;
@@ -697,8 +854,8 @@ bool AmfAv1Encoder::IsSupported() {
 
 int AmfAv1Encoder::Init(const MediaCodecConfig& config) {
   if (!ValidConfig(config)) return -1;
-  impl_->callback_worker_.Flush();
-  return impl_->worker_.Call([&] {
+  const int ret = impl_->worker_.Call([&] {
+    impl_->StopOutputThread(/*drain=*/false);
     impl_->fallback_.reset();
     impl_->config_ = config;
     impl_->config_.init_bitrate =
@@ -713,6 +870,8 @@ int AmfAv1Encoder::Init(const MediaCodecConfig& config) {
         (impl_->Initialize(nullptr, 0, 0) == AMF_OK);
     return impl_->initialized_ ? 0 : -1;
   });
+  impl_->callback_worker_.Flush();
+  return ret;
 }
 
 bool AmfAv1Encoder::SupportsNativeFrameInput(
@@ -731,11 +890,15 @@ int AmfAv1Encoder::Encode(const RawFrame& raw,
     return -1;
   }
   std::vector<EncodedFrame> frames;
+  bool delivered_async = false;
   const int result = impl_->worker_.Call([&] {
     if (!impl_->initialized_) return -1;
     if (!impl_->fallback_) {
-      const AMF_RESULT res = impl_->EncodeHardware(raw, frames);
-      if (res == AMF_OK) return 0;
+      const AMF_RESULT res = impl_->EncodeHardware(raw, callback);
+      if (res == AMF_OK) {
+        delivered_async = true;
+        return 0;
+      }
       LOG_WARN(
           "AMD AMF hardware AV1 encoding failed ({}); falling back to WMF/"
           "SVT-AV1",
@@ -770,7 +933,7 @@ int AmfAv1Encoder::Encode(const RawFrame& raw,
           return 0;
         });
   });
-  if (result == 0 && !frames.empty() && callback) {
+  if (result == 0 && !delivered_async && !frames.empty() && callback) {
     impl_->callback_worker_.Post(
         [frames = std::move(frames), cb = std::move(callback)]() mutable {
           for (const auto& frame : frames) {

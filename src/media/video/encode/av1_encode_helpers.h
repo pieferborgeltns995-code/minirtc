@@ -524,20 +524,28 @@ class EncodeStatsTracker {
         *std::max_element(total_ms_.begin(), total_ms_.end());
     const double wait_p50 = Percentile(wait_ms_, 0.50);
     const double wait_p95 = Percentile(wait_ms_, 0.95);
+    const double wait_max =
+        *std::max_element(wait_ms_.begin(), wait_ms_.end());
     const double in_p50 = Percentile(input_ms_, 0.50);
     const double in_p95 = Percentile(input_ms_, 0.95);
+    const double in_max =
+        *std::max_element(input_ms_.begin(), input_ms_.end());
     const double hw_p50 = Percentile(hw_ms_, 0.50);
     const double hw_p95 = Percentile(hw_ms_, 0.95);
+    const double hw_max =
+        *std::max_element(hw_ms_.begin(), hw_ms_.end());
     const double avg_kb = static_cast<double>(total_bytes_) /
                           (static_cast<double>(n) * 1024.0);
     LOG_INFO(
         "{} stats ({:.1f}s): {}x{} d3d11={} frames={} fps={:.1f} kf={} "
         "enc_ms[p50={:.2f} p95={:.2f} max={:.2f}] "
-        "wait_ms[p50={:.2f} p95={:.2f}] input_ms[p50={:.2f} p95={:.2f}] "
-        "hw_ms[p50={:.2f} p95={:.2f}] avg_kb={:.1f}",
+        "wait_ms[p50={:.2f} p95={:.2f} max={:.2f}] "
+        "input_ms[p50={:.2f} p95={:.2f} max={:.2f}] "
+        "hw_ms[p50={:.2f} p95={:.2f} max={:.2f}] avg_kb={:.1f}",
         encoder_tag, elapsed_s, encode_width, encode_height, using_d3d11, n,
         static_cast<double>(n) / elapsed_s, keyframes_, enc_p50, enc_p95,
-        enc_max, wait_p50, wait_p95, in_p50, in_p95, hw_p50, hw_p95, avg_kb);
+        enc_max, wait_p50, wait_p95, wait_max, in_p50, in_p95, in_max, hw_p50,
+        hw_p95, hw_max, avg_kb);
     window_start_ = now;
     total_ms_.clear();
     wait_ms_.clear();
