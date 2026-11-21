@@ -213,10 +213,10 @@ void IceTransportController::Create(bool offer_peer, std::string remote_user_id,
       ice_agent_, webrtc_clock_, task_queue_pacer_,
       UsesBoundedVideoQueue(media_config_));
   paced_sender_->SetPacingRates(DataRate::BitsPerSec(300000), DataRate::Zero());
-  // Bound single-tick pacing bursts to 5 ms (matching PacedSender's hold-back
-  // window) so high-bitrate desktop frames do not dump 40 ms of packets into
-  // the UDP socket buffer in one synchronous loop.
-  paced_sender_->SetSendBurstInterval(TimeDelta::Millis(5));
+  // Bound single-tick pacing bursts to 2 ms (matching PacedSender's hold-back
+  // window) so high-bitrate desktop frames drain rapidly without dumping large
+  // bursts into the UDP socket buffer in one synchronous loop.
+  paced_sender_->SetSendBurstInterval(TimeDelta::Millis(2));
   paced_sender_->SetQueueTimeLimit(TimeDelta::Millis(
       media_config_.video_content_type == MiniRtcVideoContentType::ScreenContent
           ? kDesktopPacerQueueLimitMs

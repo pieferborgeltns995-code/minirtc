@@ -15,8 +15,13 @@ constexpr int64_t kLossUpdateInterval = 1000;
 // Multiplicative factor that is applied to the target bitrate to calculate
 // the number of bytes that can be transmitted per interval.
 // Increasing this factor will result in lower delays in cases of bitrate
-// overshoots from the encoder.
+// overshoots from the encoder. On healthy, low-RTT direct links (e.g. LAN),
+// raise the multiplier so large desktop frames drain promptly through the pacer.
 constexpr float kDefaultPaceMultiplier = 2.5f;
+constexpr float kDirectLowRttPaceMultiplier = 4.0f;
+constexpr TimeDelta kLowRttPacingEnterMaxRtt = TimeDelta::Millis(20);
+constexpr TimeDelta kLowRttPacingExitMaxRtt = TimeDelta::Millis(25);
+constexpr uint8_t kLowRttPacingMaxLoss = 5;  // ~2% loss (5 / 255).
 
 // If the probe result is far below the current throughput estimate
 // it's unlikely that the probe is accurate, so we don't want to drop too far.
@@ -153,6 +158,7 @@ CongestionControl::CongestionControl()
       acknowledged_bitrate_estimator_(
           AcknowledgedBitrateEstimatorInterface::Create()),
       pacing_factor_(kDefaultPaceMultiplier),
+      last_reported_pacing_factor_(kDefaultPaceMultiplier),
       min_total_allocated_bitrate_(DataRate::Zero()),
       max_padding_rate_(DataRate::Zero()),
       last_loss_based_target_rate_(DataRate::Zero()) {
@@ -537,6 +543,7 @@ NetworkControlUpdate CongestionControl::SetRelayPath(bool relay_path,
   pending_probe_.reset();
   relay_path_ = relay_path;
   probe_controller_->SetRelayPath(relay_path);
+  UpdatePacingFactor();
   // A new path invalidates the held rate and the RTT baseline. A relay move
   // deliberately lowers the target, which the hold must not undo.
   last_alr_start_time_.reset();
@@ -558,6 +565,10 @@ NetworkControlUpdate CongestionControl::SetRelayPath(bool relay_path,
   if (!relay_path_ && network_available_) {
     update.probe_cluster_configs =
         probe_controller_->RequestProbeOnPathChange(at_time);
+    if (pacing_factor_ != last_reported_pacing_factor_) {
+      last_reported_pacing_factor_ = pacing_factor_;
+      update.pacer_config = GetPacingRates(at_time);
+    }
     LOG_INFO("Congestion-control probe profile updated: path=direct "
              "starting_bitrate_unchanged_bps={}",
              bandwidth_estimation_->target_rate().bps());
@@ -587,8 +598,13 @@ NetworkControlUpdate CongestionControl::OnNetworkAvailability(
     last_alr_start_time_.reset();
     ResetIdleRateHold();
   }
+  UpdatePacingFactor();
   NetworkControlUpdate update;
   update.probe_cluster_configs = probe_controller_->OnNetworkAvailability(msg);
+  if (pacing_factor_ != last_reported_pacing_factor_) {
+    last_reported_pacing_factor_ = pacing_factor_;
+    update.pacer_config = GetPacingRates(msg.at_time);
+  }
   return update;
 }
 
@@ -1016,6 +1032,24 @@ NetworkControlUpdate CongestionControl::OnTransportPacketsFeedback(
   return update;
 }
 
+void CongestionControl::UpdatePacingFactor() {
+  const TimeDelta rtt = bandwidth_estimation_->round_trip_time();
+  const uint8_t fraction_loss = bandwidth_estimation_->fraction_loss();
+  const bool healthy_direct =
+      network_available_ && !relay_path_ &&
+      delay_based_bwe_->last_state() != BandwidthUsage::kBwOverusing &&
+      !bandwidth_estimation_->IsRttAboveLimit() &&
+      bandwidth_estimation_->loss_based_state() !=
+          LossBasedState::kDecreasing &&
+      fraction_loss <= kLowRttPacingMaxLoss && rtt.IsFinite();
+  const TimeDelta rtt_limit = pacing_factor_ > kDefaultPaceMultiplier
+                                  ? kLowRttPacingExitMaxRtt
+                                  : kLowRttPacingEnterMaxRtt;
+  pacing_factor_ = (healthy_direct && rtt <= rtt_limit)
+                       ? kDirectLowRttPaceMultiplier
+                       : kDefaultPaceMultiplier;
+}
+
 void CongestionControl::MaybeTriggerOnNetworkChanged(
     NetworkControlUpdate* update, Timestamp at_time) {
   // Every estimator path (feedback, loss reports, probes, process ticks)
@@ -1027,6 +1061,7 @@ void CongestionControl::MaybeTriggerOnNetworkChanged(
         at_time);
     ApplyIdleRateHold(at_time);
   }
+  UpdatePacingFactor();
   uint8_t fraction_loss = bandwidth_estimation_->fraction_loss();
   TimeDelta round_trip_time = bandwidth_estimation_->round_trip_time();
   DataRate loss_based_target_rate = bandwidth_estimation_->target_rate();
@@ -1060,7 +1095,8 @@ void CongestionControl::MaybeTriggerOnNetworkChanged(
       (fraction_loss != last_estimated_fraction_loss_) ||
       (round_trip_time != last_estimated_round_trip_time_) ||
       (pushback_target_rate != last_pushback_target_rate_) ||
-      (stable_target_rate != last_stable_target_rate_)) {
+      (stable_target_rate != last_stable_target_rate_) ||
+      (pacing_factor_ != last_reported_pacing_factor_)) {
     last_loss_based_target_rate_ = loss_based_target_rate;
     last_pushback_target_rate_ = pushback_target_rate;
     last_estimated_fraction_loss_ = fraction_loss;
@@ -1068,6 +1104,7 @@ void CongestionControl::MaybeTriggerOnNetworkChanged(
     last_stable_target_rate_ = stable_target_rate;
     last_loss_base_state_ = loss_based_state;
     last_reported_in_alr_ = in_alr;
+    last_reported_pacing_factor_ = pacing_factor_;
 
     alr_detector_->SetEstimatedBitrate(loss_based_target_rate.bps());
 

@@ -81,6 +81,7 @@ class CongestionControl {
   DataRate OnIdleHoldSaturatedProbe(DataRate bitrate, Timestamp at_time);
   void UpdateIdleRateHold(bool in_alr, Timestamp at_time);
   void ApplyIdleRateHold(Timestamp at_time);
+  void UpdatePacingFactor();
  private:
   const bool packet_feedback_only_;
   const bool use_min_allocatable_as_lower_bound_;
@@ -126,6 +127,7 @@ class CongestionControl {
   TimeDelta last_estimated_round_trip_time_ = TimeDelta::PlusInfinity();
 
   double pacing_factor_;
+  double last_reported_pacing_factor_;
   DataRate min_total_allocated_bitrate_;
   DataRate max_padding_rate_;
 
