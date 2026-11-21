@@ -48,7 +48,7 @@ typedef void (*MiniRtcOnNetStatusReport)(const char*, const size_t, MiniRtcTrave
 
 typedef void (*MiniRtcOnSignalMessage)(const char*, size_t, void*);
 
-typedef struct {
+struct PeerConnectionParams {
   bool use_cfg_file;
   const char* cfg_path;
 
@@ -81,7 +81,7 @@ typedef struct {
   MiniRtcOnSignalExchange on_signal_exchange;
   MiniRtcOnReceiveEncodedVideo on_receive_encoded_video;
   MiniRtcVideoCodec video_codec = MiniRtcVideoCodecDefault;
-} PeerConnectionParams;
+};
 
 class PeerConnection {
  public:
