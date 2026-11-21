@@ -172,7 +172,13 @@ void IceTransportController::Create(bool offer_peer, std::string remote_user_id,
   task_queue_trans_fb_ =
       std::make_shared<TaskQueueLockFree>("transport feedback adapter");
 
-  controller_ = std::make_unique<CongestionControl>();
+  auto controller = std::make_unique<CongestionControl>();
+  // A remote desktop is idle most of the time. Like RustDesk, only confirmed
+  // congestion may lower its rate; an idle screen must not. Configure before
+  // publishing controller_ so no queued task can observe it half set up.
+  controller->SetIdleRateHold(media_config_.video_content_type ==
+                              MiniRtcVideoContentType::ScreenContent);
+  controller_ = std::move(controller);
   const int relay_path_state =
       relay_path_state_.load(std::memory_order_acquire);
   if (relay_path_state >= 0) {

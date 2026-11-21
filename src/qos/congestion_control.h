@@ -41,6 +41,12 @@ class CongestionControl {
 
   NetworkControlUpdate SetRelayPath(bool relay_path, Timestamp at_time);
 
+  // Screen content: an application-limited (idle) desktop is not evidence of
+  // a smaller link. Hold the last loaded-link rate while idle and briefly
+  // after motion resumes; only congestion confirmed under load releases it,
+  // so motion resumes at the pre-idle bitrate.
+  void SetIdleRateHold(bool enabled);
+
   void MaybeTriggerOnNetworkChanged(NetworkControlUpdate* update,
                                     Timestamp at_time);
 
@@ -53,6 +59,20 @@ class CongestionControl {
   std::optional<DataRate> FilterProbeResult(DataRate bitrate, int probe_id,
                                             Timestamp at_time);
   void MaybeApplyPendingProbe(NetworkControlUpdate* update, Timestamp at_time);
+
+  // Returns the rate the idle hold currently protects, or nullopt when the
+  // hold is disabled, not armed or released by confirmed congestion.
+  std::optional<DataRate> IdleHoldFloor(Timestamp at_time) const;
+  void ResetIdleRateHold();
+  // Per-feedback congestion evidence: the RTT baseline, consecutive high-RTT
+  // samples and loss windows. Counted in and out of ALR (the idle step-down
+  // relies on it). `delay_updated` marks a delay-based update under load,
+  // the only evidence that lets the hold learn a rate.
+  void UpdateIdleHoldFeedback(TimeDelta rtt, int64_t packets, int64_t lost,
+                              bool in_alr, bool delay_updated,
+                              Timestamp at_time);
+  void UpdateIdleRateHold(bool in_alr, Timestamp at_time);
+  void ApplyIdleRateHold(Timestamp at_time);
 
  private:
   const bool packet_feedback_only_;
@@ -115,6 +135,37 @@ class CongestionControl {
   };
   std::optional<PendingProbe> pending_probe_;
   int last_settled_probe_id_ = -1;
+
+  bool idle_rate_hold_enabled_ = false;
+  // Last target published under load and outside the post-idle grace
+  // window. Only learned once idle_hold_learned_ is set.
+  DataRate idle_hold_rate_ = DataRate::Zero();
+  // Set by a delay-based update from feedback outside ALR; cleared on reset
+  // and on release, so the hold never arms at a start rate or at the rate it
+  // has just released.
+  bool idle_hold_learned_ = false;
+  // The hold protects idle periods plus a grace window after motion resumes,
+  // so the first large frames can drain at the held rate.
+  Timestamp idle_hold_until_ = Timestamp::MinusInfinity();
+  bool idle_hold_in_alr_ = false;
+  // RTT baseline: minimum of the current and the previous bucket.
+  TimeDelta idle_hold_rtt_min_current_ = TimeDelta::PlusInfinity();
+  TimeDelta idle_hold_rtt_min_previous_ = TimeDelta::PlusInfinity();
+  Timestamp idle_hold_rtt_bucket_start_ = Timestamp::MinusInfinity();
+  // Consecutive feedback RTT samples far above the baseline: first and last.
+  int idle_hold_bad_rtt_samples_ = 0;
+  Timestamp idle_hold_bad_rtt_since_ = Timestamp::PlusInfinity();
+  Timestamp idle_hold_bad_rtt_last_ = Timestamp::MinusInfinity();
+  Timestamp idle_hold_last_rtt_sample_ = Timestamp::MinusInfinity();
+  // Loss measured over short windows; consecutive windows above the limit.
+  Timestamp idle_hold_loss_window_start_ = Timestamp::MinusInfinity();
+  int64_t idle_hold_loss_packets_ = 0;
+  int64_t idle_hold_lost_packets_ = 0;
+  int idle_hold_bad_loss_windows_ = 0;
+  double idle_hold_loss_ratio_ = 0.0;
+  // Last confirmed-congestion action; idle back-off steps are spaced out.
+  Timestamp idle_hold_last_backoff_ = Timestamp::MinusInfinity();
+  Timestamp idle_hold_last_restore_log_ = Timestamp::MinusInfinity();
 
   std::optional<DataSize> current_data_window_;
 };

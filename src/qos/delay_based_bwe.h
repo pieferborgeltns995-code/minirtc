@@ -73,6 +73,9 @@ class DelayBasedBwe {
   void SetStartBitrate(DataRate start_bitrate);
   void SetMinBitrate(DataRate min_bitrate);
   TimeDelta GetExpectedBwePeriod() const;
+  // Overwrites the delay-based estimate without replaying feedback. Used to
+  // restore a rate that an application-limited period must not erode.
+  void SetEstimate(DataRate bitrate, Timestamp at_time);
   DataRate TriggerOveruse(Timestamp at_time,
                           std::optional<DataRate> link_capacity);
   DataRate last_estimate() const { return prev_bitrate_; }
