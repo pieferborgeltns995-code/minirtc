@@ -86,6 +86,38 @@ bool IsTurnForced(MiniRtcTurnMode mode) {
   return mode == MiniRtcTurnMode::MiniRtcTurnForceUdp || mode == MiniRtcTurnMode::MiniRtcTurnForceTcp;
 }
 
+#if defined(SOL_SOCKET) && (defined(SO_SNDBUF) || defined(SO_RCVBUF))
+constexpr int kTargetUdpSocketBufferBytes = 4 * 1024 * 1024;
+constexpr int kUdpSocketBufferCandidates[] = {
+    4 * 1024 * 1024, 2 * 1024 * 1024, 1 * 1024 * 1024, 512 * 1024};
+
+bool TuneUdpSocketBufferOption(GSocket* sock, int optname, int* before_out,
+                               int* after_out) {
+  if (!sock) return false;
+  gint before = 0;
+  const bool has_before =
+      g_socket_get_option(sock, SOL_SOCKET, optname, &before, nullptr) != FALSE;
+  if (before_out) *before_out = has_before ? before : 0;
+  if (has_before && before >= kTargetUdpSocketBufferBytes) {
+    if (after_out) *after_out = before;
+    return false;
+  }
+  for (int target : kUdpSocketBufferCandidates) {
+    if (has_before && target <= before) break;
+    GError* err = nullptr;
+    if (g_socket_set_option(sock, SOL_SOCKET, optname, target, &err)) {
+      gint after = target;
+      g_socket_get_option(sock, SOL_SOCKET, optname, &after, nullptr);
+      if (after_out) *after_out = after;
+      return !has_before || after > before;
+    }
+    g_clear_error(&err);
+  }
+  if (after_out) *after_out = has_before ? before : 0;
+  return false;
+}
+#endif
+
 }  // namespace
 
 auto log_openssl_errors = []() {
@@ -986,7 +1018,91 @@ int IceAgent::GatherCandidates() {
     return -1;
   }
 
+  ConfigureUdpSocketBuffers("gather");
   return 0;
+}
+
+void IceAgent::ConfigureUdpSocketBuffers(const char* stage) {
+#if defined(SOL_SOCKET) && (defined(SO_SNDBUF) || defined(SO_RCVBUF))
+  if (!nice_inited_.load() || destroyed_.load() || stream_id_ == 0) {
+    return;
+  }
+  NiceAgent* agent = agent_.load();
+  if (agent == nullptr) {
+    return;
+  }
+
+  GPtrArray* sockets =
+      nice_agent_get_sockets(agent, stream_id_, NICE_COMPONENT_TYPE_RTP);
+  std::vector<GSocket*> datagram_sockets;
+  auto collect_socket = [&datagram_sockets](GSocket* sock) {
+    if (!sock || g_socket_get_socket_type(sock) != G_SOCKET_TYPE_DATAGRAM) {
+      return;
+    }
+    if (std::find(datagram_sockets.begin(), datagram_sockets.end(), sock) ==
+        datagram_sockets.end()) {
+      datagram_sockets.push_back(sock);
+    }
+  };
+  if (sockets != nullptr) {
+    for (guint i = 0; i < sockets->len; ++i) {
+      collect_socket(static_cast<GSocket*>(g_ptr_array_index(sockets, i)));
+    }
+  }
+  // nice_agent_get_selected_socket() returns a borrowed (transfer none)
+  // GSocket*; only inspect it on the owning ICE main-context thread.
+  GMainContext* context = gcontext_.load();
+  if (context != nullptr && g_main_context_is_owner(context)) {
+    collect_socket(nice_agent_get_selected_socket(agent, stream_id_,
+                                                  NICE_COMPONENT_TYPE_RTP));
+  }
+
+  size_t tuned_sockets = 0;
+  int snd_before = 0;
+  int snd_after = 0;
+  int rcv_before = 0;
+  int rcv_after = 0;
+  for (GSocket* sock : datagram_sockets) {
+    bool tuned = false;
+    int sb = 0, sa = 0, rb = 0, ra = 0;
+#ifdef SO_SNDBUF
+    if (TuneUdpSocketBufferOption(sock, SO_SNDBUF, &sb, &sa)) {
+      tuned = true;
+    }
+#endif
+#ifdef SO_RCVBUF
+    if (TuneUdpSocketBufferOption(sock, SO_RCVBUF, &rb, &ra)) {
+      tuned = true;
+    }
+#endif
+    if (tuned) {
+      if (tuned_sockets == 0) {
+        snd_before = sb;
+        snd_after = sa;
+        rcv_before = rb;
+        rcv_after = ra;
+      } else {
+        snd_after = std::min(snd_after, sa);
+        rcv_after = std::min(rcv_after, ra);
+      }
+      ++tuned_sockets;
+    }
+  }
+
+  if (tuned_sockets > 0) {
+    LOG_INFO(
+        "ICE UDP socket buffers tuned ({}): sockets={} sndbuf={}->{} "
+        "rcvbuf={}->{}",
+        stage ? stage : "unknown", tuned_sockets, snd_before, snd_after,
+        rcv_before, rcv_after);
+  }
+
+  if (sockets != nullptr) {
+    g_ptr_array_unref(sockets);
+  }
+#else
+  (void)stage;
+#endif
 }
 
 ICE_STATE IceAgent::GetIceState() {
@@ -1588,6 +1704,7 @@ void IceAgent::OnNiceSelectedPairStatic(NiceAgent* agent, guint stream,
       [self, agent, stream, component, local = std::string(local ? local : ""),
        remote = std::string(remote ? remote : "")] {
         if (stream == self->stream_id_ && component == NICE_COMPONENT_TYPE_RTP) {
+          self->ConfigureUdpSocketBuffers("selected_pair");
           NiceCandidate *selected_local = nullptr, *selected_remote = nullptr;
           if (!self->relay_selected_ms_ &&
               nice_agent_get_selected_pair(agent, stream, component,

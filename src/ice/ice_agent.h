@@ -176,6 +176,7 @@ class IceAgent {
                                   const gchar* server_ip, guint server_port,
                                   guint sequence, gpointer data);
   void ProbePredictedRemoteCandidates();
+  void ConfigureUdpSocketBuffers(const char* stage);
   int64_t relay_selected_ms_ = 0;
   static void OnNiceSelectedPairStatic(NiceAgent*, guint, guint, const char*,
                                        const char*, gpointer);

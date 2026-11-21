@@ -27,10 +27,10 @@ class VideoFrameCadence {
   static constexpr int64_t kRelaxedAdmissionQueueMs = 240;
   static constexpr int64_t kCongestedAdmissionQueueMs = 160;
   static constexpr int64_t kHardOldestPacketWaitMs = 280;
+  static constexpr int64_t kLowQueueThresholdMs = 20;
   static constexpr int kMinScreenFrameRate = 15;
   static constexpr int kPressureLossPercent = 10;
   static constexpr int kSevereLossPercent = 20;
-
   bool Accept(int64_t now_us, int frame_rate) {
     const int64_t interval_us = 1000000 / std::max(1, frame_rate);
     const int64_t tolerance_us = std::min<int64_t>(4000, interval_us / 4);
@@ -47,13 +47,38 @@ class VideoFrameCadence {
   // or blocked by the hard queue safety valve.
   bool AdmitScreenFrame(int64_t now_us, int max_frame_rate,
                         int64_t expected_queue_ms, int64_t oldest_wait_ms,
-                        int64_t rtt_ms, int loss_pct, bool congested) {
+                        int64_t rtt_ms, int loss_pct, bool congested,
+                        bool in_alr = false) {
     UpdateRttBaseline(now_us, rtt_ms);
-    const int64_t rtt_excess_ms = RttExcessMs(rtt_ms);
-    const bool network_pressured = congested ||
-                                   loss_pct >= kPressureLossPercent ||
-                                   rtt_excess_ms >= 60;
-    const int64_t hard_queue_limit_ms = network_pressured
+    const int64_t raw_rtt_excess_ms = RttExcessMs(rtt_ms);
+
+    // In ALR with virtually no pacer backlog (e.g. a 0.28 Mbps idle desktop
+    // right after an ALR probe), a single RTT jitter spike or sparse-window
+    // loss sample must not pace down the frame rate. Reset the RTT
+    // confirmation state so stale idle RTT cannot trip immediately on ALR exit.
+    const bool low_queue_alr =
+        in_alr && expected_queue_ms < kLowQueueThresholdMs && !congested;
+    if (low_queue_alr) {
+      ResetRttPressureConfirmation();
+    } else {
+      UpdateRttPressureConfirmation(now_us, raw_rtt_excess_ms);
+    }
+
+    const int required_rtt_windows =
+        expected_queue_ms < kLowQueueThresholdMs
+            ? kLowQueueRttConfirmWindows
+            : kQueuedRttConfirmWindows;
+    const bool rtt_confirmed =
+        !low_queue_alr &&
+        consecutive_high_rtt_windows_ >= required_rtt_windows;
+    const int64_t effective_rtt_excess_ms =
+        rtt_confirmed ? confirmed_rtt_excess_ms_ : 0;
+    const int effective_loss_pct = low_queue_alr ? 0 : loss_pct;
+
+    const bool hard_queue_pressured =
+        congested || effective_loss_pct >= kPressureLossPercent ||
+        (!low_queue_alr && raw_rtt_excess_ms >= 60);
+    const int64_t hard_queue_limit_ms = hard_queue_pressured
                                             ? kCongestedAdmissionQueueMs
                                             : kRelaxedAdmissionQueueMs;
     if (expected_queue_ms >= hard_queue_limit_ms ||
@@ -61,24 +86,29 @@ class VideoFrameCadence {
       return false;
     }
 
+    const bool network_pressured = congested ||
+                                   effective_loss_pct >= kPressureLossPercent ||
+                                   effective_rtt_excess_ms >= 60;
+
     int desired_level = 0;
     if (!network_pressured) {
-      // No heavy loss and no RTT build-up: let normal encoder bursts
+      // No heavy loss and no confirmed RTT build-up: let normal encoder bursts
       // (<160 ms) pass at full frame rate, and gently halve the rate in the
       // 160-240 ms band.
       if (expected_queue_ms >= kCongestedAdmissionQueueMs) {
         desired_level = 2;
       }
-    } else if (rtt_excess_ms >= 150 || loss_pct >= kSevereLossPercent ||
+    } else if (effective_rtt_excess_ms >= 150 ||
+               effective_loss_pct >= kSevereLossPercent ||
                expected_queue_ms >= 130) {
       desired_level = 3;
-    } else if (rtt_excess_ms >= 100 || loss_pct >= kPressureLossPercent ||
+    } else if (effective_rtt_excess_ms >= 100 ||
+               effective_loss_pct >= kPressureLossPercent ||
                expected_queue_ms >= 90 || congested) {
       desired_level = 2;
-    } else if (rtt_excess_ms >= 60 || expected_queue_ms >= 60) {
+    } else if (effective_rtt_excess_ms >= 60 || expected_queue_ms >= 60) {
       desired_level = 1;
     }
-
     if (desired_level > pressure_level_) {
       pressure_level_ = desired_level;
       hold_level_until_us_ = now_us + kStepHoldUs;
@@ -125,8 +155,10 @@ class VideoFrameCadence {
  private:
   static constexpr int64_t kRttBucketUs = 10'000'000;
   static constexpr int64_t kStepHoldUs = 300'000;
+  static constexpr int64_t kRttSampleWindowUs = 50'000;
+  static constexpr int kQueuedRttConfirmWindows = 2;
+  static constexpr int kLowQueueRttConfirmWindows = 6;
   static constexpr int64_t kUnsetRttMs = INT64_MAX;
-
   static int EffectiveFrameRateForLevel(int max_fps, int level) {
     const int floor_fps = std::min(max_fps, kMinScreenFrameRate);
     switch (level) {
@@ -158,6 +190,33 @@ class VideoFrameCadence {
     return std::max<int64_t>(0, rtt_ms - baseline_ms);
   }
 
+  void ResetRttPressureConfirmation() {
+    consecutive_high_rtt_windows_ = 0;
+    last_rtt_pressure_sample_us_ = 0;
+    confirmed_rtt_excess_ms_ = 0;
+  }
+
+  void UpdateRttPressureConfirmation(int64_t now_us, int64_t raw_rtt_excess_ms) {
+    if (raw_rtt_excess_ms < 60) {
+      ResetRttPressureConfirmation();
+      return;
+    }
+    if (consecutive_high_rtt_windows_ == 0) {
+      consecutive_high_rtt_windows_ = 1;
+      last_rtt_pressure_sample_us_ = now_us;
+      confirmed_rtt_excess_ms_ = raw_rtt_excess_ms;
+      return;
+    }
+    if (now_us - last_rtt_pressure_sample_us_ >= kRttSampleWindowUs) {
+      ++consecutive_high_rtt_windows_;
+      last_rtt_pressure_sample_us_ = now_us;
+      // Smooth across confirmed windows so a single high outlier does not
+      // jump straight to the severest frame-rate floor.
+      confirmed_rtt_excess_ms_ =
+          (confirmed_rtt_excess_ms_ * 2 + raw_rtt_excess_ms + 1) / 3;
+    }
+  }
+
   int64_t next_frame_us_ = 0;
   int64_t next_admitted_us_ = 0;
   int64_t last_admitted_us_ = 0;
@@ -166,6 +225,9 @@ class VideoFrameCadence {
   int64_t rtt_min_current_ms_ = kUnsetRttMs;
   int64_t rtt_min_prev_ms_ = kUnsetRttMs;
   int64_t rtt_bucket_start_us_ = 0;
+  int consecutive_high_rtt_windows_ = 0;
+  int64_t last_rtt_pressure_sample_us_ = 0;
+  int64_t confirmed_rtt_excess_ms_ = 0;
 };
 }  // namespace minirtc
 

@@ -122,20 +122,24 @@ int64_t TransportFeedbackAdapter::AddPacket(const RtpPacketToSend& packet_to_sen
              kSendTimeHistoryWindow) {
     // TODO(sprang): Warn if erasing (too many) old items?
     if (history_.begin()->second.sent.sequence_number > last_ack_seq_num_)
-      in_flight_.RemoveInFlightPacketBytes(history_.begin()->second);
+      RemoveInFlightPacketBytes(history_.begin()->second);
 
     const PacketFeedback& packet = history_.begin()->second;
-    rtp_to_transport_sequence_number_.erase(
+    auto map_it = rtp_to_transport_sequence_number_.find(
         {packet.ssrc, packet.rtp_sequence_number});
+    if (map_it != rtp_to_transport_sequence_number_.end() &&
+        map_it->second == packet.sent.sequence_number) {
+      rtp_to_transport_sequence_number_.erase(map_it);
+    }
     history_.erase(history_.begin());
   }
   // Note that it can happen that the same SSRC and sequence number is sent
-  // again. e.g, audio retransmission.
-  // A new send reusing the same RTP key must not be classified as duplicate
-  // feedback for the previous send.
+  // again. e.g, audio retransmission or 16-bit RTP sequence wraparound.
+  // A new send reusing the same RTP key must overwrite any stale unacked
+  // mapping and must not be classified as duplicate feedback for the old send.
   recently_acknowledged_packets_.erase(
       {feedback.ssrc, feedback.rtp_sequence_number});
-  rtp_to_transport_sequence_number_.emplace(
+  rtp_to_transport_sequence_number_.insert_or_assign(
       SsrcAndRtpSequencenumber({feedback.ssrc, feedback.rtp_sequence_number}),
       feedback.sent.sequence_number);
   history_.emplace(feedback.sent.sequence_number, feedback);
@@ -160,15 +164,27 @@ bool TransportFeedbackAdapter::RemovePacket(
   if (mapping_it == rtp_to_transport_sequence_number_.end()) {
     return false;
   }
+  if (packet_to_send.transport_sequence_number().has_value() &&
+      static_cast<uint16_t>(mapping_it->second) !=
+          static_cast<uint16_t>(*packet_to_send.transport_sequence_number())) {
+    return false;
+  }
 
   auto history_it = history_.find(mapping_it->second);
   if (history_it != history_.end()) {
-    if (history_it->second.sent.send_time.IsFinite()) {
-      in_flight_.RemoveInFlightPacketBytes(history_it->second);
-    }
+    RemoveInFlightPacketBytes(history_it->second);
     history_.erase(history_it);
   }
   rtp_to_transport_sequence_number_.erase(mapping_it);
+  return true;
+}
+
+bool TransportFeedbackAdapter::MarkPacketSendFailed(int64_t transport_seq_num) {
+  auto history_it = history_.find(transport_seq_num);
+  if (history_it == history_.end()) {
+    return false;
+  }
+  RemoveInFlightPacketBytes(history_it->second);
   return true;
 }
 
@@ -196,7 +212,7 @@ std::optional<SentPacket> TransportFeedbackAdapter::ProcessSentPacket(
       }
       if (!packet_retransmit) {
         if (it->second.sent.sequence_number > last_ack_seq_num_)
-          in_flight_.AddInFlightPacketBytes(it->second);
+          AddInFlightPacketBytes(it->second);
         it->second.sent.data_in_flight = GetOutstandingData();
         return it->second.sent;
       }
@@ -358,6 +374,18 @@ bool TransportFeedbackAdapter::WasRecentlyAcknowledged(
          recently_acknowledged_packets_.end();
 }
 
+void TransportFeedbackAdapter::AddInFlightPacketBytes(PacketFeedback& packet) {
+  if (packet.in_flight) return;
+  in_flight_.AddInFlightPacketBytes(packet);
+  packet.in_flight = true;
+}
+
+void TransportFeedbackAdapter::RemoveInFlightPacketBytes(
+    PacketFeedback& packet) {
+  if (!packet.in_flight) return;
+  in_flight_.RemoveInFlightPacketBytes(packet);
+  packet.in_flight = false;
+}
 std::optional<PacketFeedback> TransportFeedbackAdapter::RetrievePacketFeedback(
     const SsrcAndRtpSequencenumber& key, bool received) {
   auto it = rtp_to_transport_sequence_number_.find(key);
@@ -374,7 +402,7 @@ std::optional<PacketFeedback> TransportFeedbackAdapter::RetrievePacketFeedback(
     // valid sequence number is >= 0.
     for (auto it = history_.upper_bound(last_ack_seq_num_);
          it != history_.upper_bound(transport_seq_num); ++it) {
-      in_flight_.RemoveInFlightPacketBytes(it->second);
+      RemoveInFlightPacketBytes(it->second);
     }
     last_ack_seq_num_ = transport_seq_num;
   }
@@ -400,8 +428,12 @@ std::optional<PacketFeedback> TransportFeedbackAdapter::RetrievePacketFeedback(
   if (received) {
     // Note: Lost packets are not removed from history because they might
     // be reported as received by a later feedback.
-    rtp_to_transport_sequence_number_.erase(
+    auto map_it = rtp_to_transport_sequence_number_.find(
         {packet_feedback.ssrc, packet_feedback.rtp_sequence_number});
+    if (map_it != rtp_to_transport_sequence_number_.end() &&
+        map_it->second == transport_seq_num) {
+      rtp_to_transport_sequence_number_.erase(map_it);
+    }
     history_.erase(it);
   }
   return packet_feedback;

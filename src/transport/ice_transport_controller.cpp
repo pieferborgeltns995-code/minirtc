@@ -51,6 +51,24 @@ bool UsesBoundedVideoQueue(const MediaCodecConfig& config) {
              MiniRtcVideoDegradationPreference::MaintainResolution;
 }
 
+const char* RtpPacketMediaTypeName(
+    std::optional<webrtc::RtpPacketMediaType> type) {
+  if (!type.has_value()) return "unknown";
+  switch (*type) {
+    case webrtc::RtpPacketMediaType::kAudio:
+      return "audio";
+    case webrtc::RtpPacketMediaType::kVideo:
+      return "video";
+    case webrtc::RtpPacketMediaType::kRetransmission:
+      return "rtx";
+    case webrtc::RtpPacketMediaType::kForwardErrorCorrection:
+      return "fec";
+    case webrtc::RtpPacketMediaType::kPadding:
+      return "padding";
+  }
+  return "unknown";
+}
+
 int ResolveEncoderTargetBitrate(int requested_bitrate,
                                 std::optional<int> applied_bitrate,
                                 bool in_alr, int loss_pct, bool is_congested,
@@ -195,7 +213,10 @@ void IceTransportController::Create(bool offer_peer, std::string remote_user_id,
       ice_agent_, webrtc_clock_, task_queue_pacer_,
       UsesBoundedVideoQueue(media_config_));
   paced_sender_->SetPacingRates(DataRate::BitsPerSec(300000), DataRate::Zero());
-  paced_sender_->SetSendBurstInterval(TimeDelta::Millis(40));
+  // Bound single-tick pacing bursts to 5 ms (matching PacedSender's hold-back
+  // window) so high-bitrate desktop frames do not dump 40 ms of packets into
+  // the UDP socket buffer in one synchronous loop.
+  paced_sender_->SetSendBurstInterval(TimeDelta::Millis(5));
   paced_sender_->SetQueueTimeLimit(TimeDelta::Millis(
       media_config_.video_content_type == MiniRtcVideoContentType::ScreenContent
           ? kDesktopPacerQueueLimitMs
@@ -205,7 +226,9 @@ void IceTransportController::Create(bool offer_peer, std::string remote_user_id,
   // The pacer serializes this callback, and Send consumes its buffer before
   // returning, so the callback can retain and reuse its SRTP scratch space.
   paced_sender_->SetOnSentPacketFunc(
-      [weak_this, protected_packet = std::vector<uint8_t>()](
+      [weak_this, protected_packet = std::vector<uint8_t>(),
+       send_fail_total = uint64_t{0}, send_fail_suppressed = uint64_t{0},
+       last_send_fail_log_ms = int64_t{0}](
           std::unique_ptr<webrtc::RtpPacketToSend> packet,
           const webrtc::PacedPacketInfo& pacing_info) mutable {
         if (auto self = weak_this.lock()) {
@@ -280,6 +303,22 @@ void IceTransportController::Create(bool offer_peer, std::string remote_user_id,
           const int send_result =
               self->ice_agent_->Send(send_buffer, send_size);
           if (send_result < 0) {
+            ++send_fail_total;
+            const int64_t now_ms = self->clock_->CurrentTimeMs();
+            if (send_fail_total <= 5 ||
+                now_ms - last_send_fail_log_ms >= 1000) {
+              LOG_WARN(
+                  "ICE RTP send failed: ssrc={} seq={} type={} size={} "
+                  "probe_id={} total_failed={} suppressed={}",
+                  packet->Ssrc(), packet->SequenceNumber(),
+                  RtpPacketMediaTypeName(packet->packet_type()), send_size,
+                  pacing_info.probe_cluster_id, send_fail_total,
+                  send_fail_suppressed);
+              last_send_fail_log_ms = now_ms;
+              send_fail_suppressed = 0;
+            } else {
+              ++send_fail_suppressed;
+            }
             self->RollbackPacketFeedback(*packet, feedback_registration);
             notify_send_failure();
             return;
@@ -799,7 +838,8 @@ int IceTransportController::SendVideo(const MiniRtcVideoFrame* video_frame,
                     clock_->CurrentTimeUs(), media_config_.max_frame_rate,
                     expected_queue_ms, oldest_wait_ms,
                     context->last_network_rtt_ms,
-                    context->last_network_loss_pct, is_congested_.load());
+                    context->last_network_loss_pct, is_congested_.load(),
+                    context->last_network_in_alr);
       if (!admitted) {
         context->pacer_rejected_frame_total.fetch_add(
             1, std::memory_order_relaxed);
@@ -3476,12 +3516,19 @@ IceTransportController::RegisterPacketForFeedback(
 void IceTransportController::RollbackPacketFeedback(
     const webrtc::RtpPacketToSend& packet,
     const PacketFeedbackRegistration& registration) {
+  (void)packet;
   if (!registration.tracked) {
     return;
   }
   std::lock_guard<std::mutex> lock(transport_feedback_adapter_mutex_);
   transport_feedback_adapter_.RemoveFecSend(registration.fec_feedback_id);
-  transport_feedback_adapter_.RemovePacket(packet);
+  // The RTP sequence number and SRTP index were already consumed before Send().
+  // Keep the feedback history entry so RFC 8888 reports resolve cleanly and
+  // report the real packet loss to BWE, while removing unsent in-flight bytes.
+  if (registration.fec_feedback_id >= 0) {
+    transport_feedback_adapter_.MarkPacketSendFailed(
+        registration.fec_feedback_id);
+  }
 }
 
 void IceTransportController::OnSentPacket(

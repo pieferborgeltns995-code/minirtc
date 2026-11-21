@@ -44,11 +44,10 @@ struct PacketFeedback {
 
   // The network route that this packet is associated with.
   rtc::NetworkRoute network_route;
-
   uint32_t ssrc = 0;
   uint16_t rtp_sequence_number = 0;
+  bool in_flight = false;
 };
-
 class InFlightBytesTracker {
  public:
   void AddInFlightPacketBytes(const PacketFeedback& packet);
@@ -79,6 +78,12 @@ class TransportFeedbackAdapter {
   // Removes a packet registered before the transport reported a send failure.
   // Returns true when a matching history entry was removed.
   bool RemovePacket(const RtpPacketToSend& packet);
+
+  // Marks a registered packet as failed to send locally: removes its unsent
+  // bytes from in-flight tracking while keeping its history entry so RFC 8888
+  // feedback for the already-assigned RTP sequence number resolves cleanly and
+  // reports the real loss to congestion control.
+  bool MarkPacketSendFailed(int64_t transport_seq_num);
 
   std::optional<SentPacket> ProcessSentPacket(
       const rtc::SentPacket& sent_packet);
@@ -127,7 +132,8 @@ class TransportFeedbackAdapter {
                                   Timestamp acknowledgment_time);
   bool WasRecentlyAcknowledged(
       const SsrcAndRtpSequencenumber& key) const;
-
+  void AddInFlightPacketBytes(PacketFeedback& packet);
+  void RemoveInFlightPacketBytes(PacketFeedback& packet);
   DataSize pending_untracked_size_ = DataSize::Zero();
   Timestamp last_send_time_ = Timestamp::MinusInfinity();
   Timestamp last_untracked_send_time_ = Timestamp::MinusInfinity();
